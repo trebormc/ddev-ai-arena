@@ -1,0 +1,85 @@
+name: ddev-ai-arena
+
+ddev_version_constraint: '>= v1.24.10'
+
+dependencies: []
+
+pre_install_actions:
+  - |
+    #ddev-description:Checking prerequisites for ai-arena
+    for tool in git jq; do
+      if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ai-arena needs '$tool' on the host PATH." >&2
+        exit 1
+      fi
+    done
+    echo "Installing ddev-ai-arena add-on..."
+
+project_files:
+  - commands/host/ai-arena
+  - ai-arena/prompts/plan.md
+  - ai-arena/prompts/candidate.md
+  - ai-arena/prompts/pm.md
+  - ai-arena/prompts/judge.md
+
+global_files: []
+
+post_install_actions:
+  - |
+    #ddev-description:Creating .env.ai-arena defaults
+    if [ ! -f .env.ai-arena ]; then
+      cat > .env.ai-arena <<'ENV'
+# ddev-ai-arena — host-side arena of parallel candidates in isolated worktrees.
+# Each line is optional. The command reads this file on every run.
+
+# Default candidate panel: comma-separated "harness:model" entries.
+#   harness = claude | opencode
+#   model   = Claude Code alias/model id, or OpenCode "provider/model"
+#   Omit ":model" to use the container's default model.
+AI_ARENA_DEFAULT_CANDIDATES=claude:opus,claude:sonnet,opencode
+
+# Harness and model for the project manager session (runs in THIS project's
+# AI container: writes the brief, answers candidates, judges).
+AI_ARENA_PM_HARNESS=claude
+AI_ARENA_PM_MODEL=
+
+# Hard cap on candidates per arena (each one is a full DDEV project).
+AI_ARENA_MAX_CANDIDATES=3
+
+# Seconds `ai-arena wait` blocks before giving up (0 = forever).
+AI_ARENA_TIMEOUT=7200
+
+# Git ref the candidate branches start from.
+AI_ARENA_BASE_REF=HEAD
+
+# Database source for candidate environments, tried in this order:
+#   snapshot  — restore the DDEV snapshot named below if this project has it
+#   file      — import AI_ARENA_DB_FILE
+#   export    — export this project's database once per arena and import it
+AI_ARENA_DB_SNAPSHOT=baseline
+AI_ARENA_DB_FILE=
+
+# Extra untracked/ignored files to copy from the main repo into each candidate
+# (space-separated git pathspecs). settings.local.php and the usual dev
+# services files are always copied.
+AI_ARENA_LOCAL_FILES=
+
+# Optional hooks that REPLACE the built-in environment creation/removal.
+# Placeholders: {branch} {env_name} {env_dir} {approot} {label}
+AI_ARENA_SPAWN_HOOK=
+AI_ARENA_REMOVE_HOOK=
+
+# Provisioning steps (ddev subcommands, ';'-separated) run in each candidate
+# after its database is in place.
+AI_ARENA_PROVISION="drush cr; drush updb -y; drush cim -y; drush cim -y"
+ENV
+      echo "Created .ddev/.env.ai-arena (review the defaults)."
+    fi
+    echo ""
+    echo "ai-arena installed. Run 'ddev ai-arena doctor' to check the host, then"
+    echo "install the host skill: see host/README.md in the add-on repository."
+
+removal_actions:
+  - |
+    #ddev-description:Cleaning up ai-arena
+    echo "ai-arena add-on removed (.ddev/.env.ai-arena and arena/ directories are kept)."
