@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Remove an environment created by worktree-add: the DDEV project (containers and
+# database), the git worktree, and the directory. The main environment is protected.
+#
+# Usage: worktree-remove [options] <branch | env-name | env-dir>
+#   --project <dir>   coordinator directory (default: current directory)
+#   --tmp-only        refuse anything outside <project>/worktree-tmp/
+#   --keep-branch     do not delete the git branch
+#   -y                no confirmation prompt
+#   -f                force worktree removal even with uncommitted changes
+set -euo pipefail
+
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project="$PWD"; tmp_only=0; keep_branch=0; yes=0; force=0; target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) project="$2"; shift 2 ;;
+    --tmp-only) tmp_only=1; shift ;;
+    --keep-branch) keep_branch=1; shift ;;
+    -y) yes=1; shift ;;
+    -f|--force) force=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) [ -z "$target" ] && target="$1" || die "unexpected argument $1"; shift ;;
+  esac
+done
+[ -n "$target" ] || { usage >&2; exit 1; }
+project="$(cd "$project" && pwd)"
+
+# shellcheck source=lib.sh
+. "$SCRIPT_DIR/lib.sh"
+locate_main_env "$project"
+
+# Resolve the target to an environment directory.
+dest=""
+if [ -d "$target" ]; then
+  dest="$(cd "$target" && pwd)"
+else
+  n="$target"
+  case "$n" in */*) n="${BASE}-$(printf '%s' "$n" | tr '/' '-')" ;; esac
+  for cand in "$project/worktree-tmp/$n" "$project/worktree/$n" "$project/worktree-tmp/${BASE}-$n" "$project/worktree/${BASE}-$n"; do
+    [ -d "$cand" ] && { dest="$cand"; break; }
+  done
+fi
+[ -n "$dest" ] || die "no environment found for '$target' under $project/worktree-tmp or $project/worktree"
+[ "$dest" != "$MAIN_ENV" ] || die "'$dest' is the main environment; refusing"
+case "$dest" in "$project/worktree-tmp/"*|"$project/worktree/"*) ;; *) die "'$dest' is outside $project/worktree-tmp and $project/worktree; refusing" ;; esac
+if [ "$tmp_only" = "1" ]; then case "$dest" in "$project/worktree-tmp/"*) ;; *) die "'$dest' is not under worktree-tmp (--tmp-only)" ;; esac; fi
+
+env_name="$(sed -nE 's/^name:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$dest/.ddev/config.yaml" 2>/dev/null | head -n1 || true)"
+[ -n "$env_name" ] || env_name="$(basename "$dest")"
+wt_repo="$dest/$REPO_REL"
+branch=""
+[ -e "$wt_repo/.git" ] && branch="$(git -C "$wt_repo" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+
+echo "About to remove environment '$env_name':" >&2
+echo "  - DDEV project '$env_name' (containers and database)" >&2
+echo "  - git worktree $wt_repo${branch:+ (branch $branch)}" >&2
+echo "  - directory $dest" >&2
+if [ "$yes" = "0" ]; then
+  read -r -p "Continue? [y/N] " answer
+  case "$answer" in [yY]*) ;; *) echo "Cancelled." >&2; exit 0 ;; esac
+fi
+
+log "ddev delete $env_name"
+ddev delete -Oy "$env_name" >/dev/null 2>&1 || warn "ddev delete failed or project not registered ($env_name)"
+
+if [ -e "$wt_repo/.git" ]; then
+  flags=(); [ "$force" = "1" ] && flags+=(--force)
+  if ! git -C "$REPO_DIR" worktree remove "${flags[@]}" "$wt_repo"; then
+    die "git refused to remove the worktree (uncommitted changes?). Review them or repeat with -f"
+  fi
+fi
+git -C "$REPO_DIR" worktree prune
+
+log "removing $dest"
+rm -rf "$dest"
+
+if [ "$keep_branch" = "0" ] && [ -n "$branch" ] && [ "$branch" != "HEAD" ] && git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
+  git -C "$REPO_DIR" branch -D "$branch" >/dev/null && log "deleted branch $branch"
+fi
+
+log "environment '$env_name' removed"

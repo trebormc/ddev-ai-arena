@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# ai-arena: run the same task through several AI candidates in parallel, each in
+# its own worktree environment, gate them mechanically, judge them blind, promote
+# the winner. Runs ON THE HOST from a coordinator project directory:
+#
+#   <project>/
+#   ├── .ddev/            coordinator DDEV project (AI containers only, no Drupal)
+#   ├── arena/<slug>/     arena state: manifest, brief, PM sessions, collected candidates
+#   ├── main/             main environment (.ddev/ + <repo>/), never touched
+#   ├── worktree/         real branch environments (promote --env creates one here)
+#   └── worktree-tmp/     candidates (created by spawn, deleted by clean)
+#
+# Every LLM step runs inside AI containers (the coordinator's for the project
+# manager, each candidate's own for the work) through docker exec. Every mechanical
+# step is a deterministic subcommand, so the host agent picks verbs and reads JSON.
+# Only worktree-tmp/ environments and tmp/* branches are ever deleted.
+set -euo pipefail
+
+VERSION="0.2.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROMPTS_DIR="$SCRIPT_DIR/../prompts"
+CONTAINER_ROOT="/var/www/html"
+WINS_LOG="${HOME}/.ddev/ai-arena/wins.tsv"
+GLOBAL_CONFIG="${HOME}/.ddev/ai-arena/config.env"
+
+# ---------------------------------------------------------------------------
+# Defaults, then ~/.ddev/ai-arena/config.env, then <project>/ai-arena.env
+# ---------------------------------------------------------------------------
+AI_ARENA_DEFAULT_CANDIDATES="claude:opus,claude:sonnet,opencode"
+AI_ARENA_PM_HARNESS="claude"
+AI_ARENA_PM_MODEL=""
+AI_ARENA_MAX_CANDIDATES=3
+AI_ARENA_TIMEOUT=7200
+AI_ARENA_BASE_REF=""
+AI_ARENA_DB="auto"
+AI_ARENA_LOCAL_FILES=""
+AI_ARENA_MAIN_ENV=""
+
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required on the host PATH"; }
+now()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# shellcheck source=lib.sh
+. "$SCRIPT_DIR/lib.sh"
+
+usage() {
+  cat <<EOF
+ai-arena $VERSION — parallel AI candidates in isolated worktree environments
+
+Usage: ai-arena [--project <dir>] <command> [args]      (default project: current directory)
+
+  doctor                                   Check host tools, layout, coordinator containers
+  up                                       Start the coordinator project's containers
+  init "<task>" [--candidates a,b] [--pm harness[:model]] [--description "..."]
+                                           Create arena/<slug>/manifest.json
+  plan <slug> ["description"]              PM session writes arena/<slug>/brief.md
+  spawn <slug> [label...]                  Create candidate environments (worktree-add --tmp)
+  run <slug> [label...]                    Start candidates (detached) on the brief
+  wait <slug> [--all] [--timeout S]        Block until a candidate changes state (or all finish)
+  status <slug> [--json]                   Show candidate states
+  resume <slug> <label> "<message>"        Continue a candidate's session with a message
+  pm <slug> "<message>"                    Send a message to the PM session, print its verdict
+  gate <slug> [label...]                   Mechanical gates (site, phpstan, phpcs, phpunit)
+  collect <slug>                           Gather diffs, reports and gates into arena/<slug>/candidates/
+  judge <slug>                             PM judges the collected candidates (blind)
+  promote <slug> <label> [--branch name] [--env]
+                                           feature/<slug> from the winner (optionally its environment)
+  reveal <slug>                            Label -> harness/model, log the win
+  clean <slug> [--keep label] [--purge]    Delete candidate environments and tmp/ branches
+  list                                     Arenas in this project
+
+Config: ~/.ddev/ai-arena/config.env (all projects), <project>/ai-arena.env (this project)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Project (coordinator) resolution
+# ---------------------------------------------------------------------------
+resolve_project() {
+  PROJECT="$(cd "${PROJECT:-$PWD}" && pwd)"
+  [ -f "$PROJECT/.ddev/config.yaml" ] || die "$PROJECT is not a DDEV project (no .ddev/config.yaml); run from the coordinator directory or pass --project"
+  # shellcheck disable=SC1090
+  [ -f "$GLOBAL_CONFIG" ] && { set -a; . "$GLOBAL_CONFIG"; set +a; }
+  # shellcheck disable=SC1090
+  [ -f "$PROJECT/ai-arena.env" ] && { set -a; . "$PROJECT/ai-arena.env"; set +a; }
+  COORD="$(sed -nE 's/^name:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$PROJECT/.ddev/config.yaml" | head -n1 || true)"
+  [ -n "$COORD" ] || COORD="$(basename "$PROJECT")"
+  locate_main_env "$PROJECT"      # MAIN_ENV, REPO_REL, REPO_DIR, BASE
+  case "$MAIN_ENV" in "$PROJECT"/*) MAIN_REL="${MAIN_ENV#"$PROJECT"/}" ;; *) die "the main environment must be inside $PROJECT (found $MAIN_ENV)" ;; esac
+  TMP_DIR="$PROJECT/worktree-tmp"
+  WT_DIR="$PROJECT/worktree"
+  CONTAINER_REPO="$CONTAINER_ROOT/$MAIN_REL/$REPO_REL"
+  LIVE_ROOT="$CONTAINER_ROOT/worktree-tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+arena_dir() { printf '%s/arena/%s' "$PROJECT" "$1"; }
+
+mf_require() {
+  SLUG="$1"
+  ARENA_DIR="$(arena_dir "$SLUG")"
+  MANIFEST="$ARENA_DIR/manifest.json"
+  [ -f "$MANIFEST" ] || die "no arena '$SLUG' (expected $MANIFEST). Run: ai-arena init"
+  CONTAINER_ARENA="$CONTAINER_ROOT/arena/$SLUG"
+}
+mf_get() { jq -r "$1" "$MANIFEST"; }
+mf_update() { local tmp; tmp="$(mktemp)"; jq "$@" "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"; }
+cand_get() { jq -r --arg l "$1" ".candidates[] | select(.label==\$l) | $2" "$MANIFEST"; }
+cand_set() { mf_update --arg l "$1" --arg k "$2" --arg v "$3" '(.candidates[] | select(.label==$l))[$k] = $v | .updated = (now | todate)'; }
+cand_set_json() { mf_update --arg l "$1" --arg k "$2" --argjson v "$3" '(.candidates[] | select(.label==$l))[$k] = $v'; }
+labels() { jq -r '.candidates[].label' "$MANIFEST"; }
+resolve_labels() { if [ $# -eq 0 ]; then labels; else printf '%s\n' "$@"; fi; }
+guard_label() { jq -e --arg l "$1" '.candidates[] | select(.label==$l)' "$MANIFEST" >/dev/null || die "unknown candidate label '$1'"; }
+
+slugify() {
+  local s
+  s="$(printf '%s' "$1" | { iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || cat; } \
+      | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+  if [ ${#s} -gt 32 ]; then s="${s:0:32}"; case "$s" in *-*) s="${s%-*}" ;; esac; fi
+  printf '%s' "$s" | sed -E 's/-+$//'
+}
+
+# ---------------------------------------------------------------------------
+# Harness plumbing (all LLM work happens inside the AI containers)
+# ---------------------------------------------------------------------------
+harness_user() { case "$1" in claude) echo claude ;; opencode) echo opencode ;; *) die "unknown harness '$1' (use claude or opencode)" ;; esac; }
+container_for() { case "$1" in claude) echo "ddev-$2-claude-code" ;; opencode) echo "ddev-$2-opencode" ;; *) die "unknown harness '$1'" ;; esac; }
+container_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; }
+
+harness_cmd() { # harness model session prompt_file_in_container
+  local harness="$1" model="$2" session="$3" pfile="$4" cmd
+  case "$harness" in
+    claude)
+      cmd="claude -p --output-format json --permission-mode bypassPermissions"
+      [ -n "$model" ] && cmd="$cmd --model '$model'"
+      [ -n "$session" ] && cmd="$cmd --resume '$session'" ;;
+    opencode)
+      cmd="opencode run --format json"
+      [ -n "$model" ] && cmd="$cmd -m '$model'"
+      [ -n "$session" ] && cmd="$cmd -s '$session'" ;;
+  esac
+  printf '%s "$(cat %s)"' "$cmd" "$pfile"
+}
+
+session_from_output() { # harness file
+  case "$1" in
+    claude) jq -r 'if type=="array" then (.[] | select(.session_id?) | .session_id) else (.session_id // empty) end' "$2" 2>/dev/null | head -n1 ;;
+    opencode) grep -o '"sessionID":"[^"]*"' "$2" 2>/dev/null | head -n1 | cut -d'"' -f4 ;;
+  esac
+}
+
+result_text() { # harness file
+  case "$1" in
+    claude) jq -r 'if type=="array" then (.[] | select(.result?) | .result) else (.result // empty) end' "$2" 2>/dev/null || cat "$2" ;;
+    opencode)
+      if jq -e . "$2" >/dev/null 2>&1 || jq -e -s . "$2" >/dev/null 2>&1; then
+        jq -r 'select(.type=="text" or .type=="message.part.updated") | (.part.text // .text // empty)' "$2" 2>/dev/null | grep -v '^$' || cat "$2"
+      else cat "$2"; fi ;;
+  esac
+}
+
+parse_verdict() { # text_file -> json
+  local f="$1" verdict to winner message
+  verdict="$(grep -E '^VERDICT:' "$f" | tail -n1 | sed -E 's/^VERDICT:[[:space:]]*//' || true)"
+  to="$(grep -E '^TO:' "$f" | tail -n1 | sed -E 's/^TO:[[:space:]]*//' || true)"
+  winner="$(grep -E '^WINNER:' "$f" | tail -n1 | sed -E 's/^WINNER:[[:space:]]*//' || true)"
+  message="$(awk 'found{print} /^MESSAGE:/{found=1; sub(/^MESSAGE:[[:space:]]*/, ""); print}' "$f" || true)"
+  jq -n --arg verdict "$verdict" --arg to "$to" --arg winner "$winner" --arg message "$message" --rawfile raw "$f" \
+    '{verdict:$verdict, to:$to, winner:$winner, message:$message, raw:$raw}'
+}
+
+fill_prompt() { # template_name [extra sed args...]
+  local t="$1"; shift
+  sed -e "s|{{SLUG}}|$SLUG|g" -e "s|{{ARENA}}|$CONTAINER_ARENA|g" -e "s|{{REPO}}|$CONTAINER_REPO|g" -e "s|{{LIVE}}|$LIVE_ROOT|g" "$@" "$PROMPTS_DIR/$t"
+}
+
+# Synchronous call to the PM session in the coordinator's AI container.
+pm_call() { # message -> prints JSON verdict; stores the session id
+  local harness model session container user pfile out logf cmd text
+  harness="$(mf_get '.pm.harness')"; model="$(mf_get '.pm.model // empty')"; session="$(mf_get '.pm.session // empty')"
+  user="$(harness_user "$harness")"; container="$(container_for "$harness" "$COORD")"
+  container_running "$container" || die "container $container is not running (ai-arena up)"
+  mkdir -p "$ARENA_DIR/pm"
+  pfile="$ARENA_DIR/pm/prompt-$(date +%s).txt"; out="${pfile%.txt}.json"; logf="${pfile%.txt}.log"
+  if [ -z "$session" ]; then { fill_prompt pm.md; printf '\n\n%s\n' "$1"; } > "$pfile"; else printf '%s\n' "$1" > "$pfile"; fi
+  cmd="$(harness_cmd "$harness" "$model" "$session" "$CONTAINER_ARENA/pm/$(basename "$pfile")")"
+  log "pm ($harness${model:+ $model}${session:+, resumed}) ..."
+  docker exec -i -u "$user" -w "$CONTAINER_ROOT" "$container" bash -c "$cmd" > "$out" 2> "$logf" || warn "pm call exited non-zero; see $logf"
+  if [ -z "$session" ]; then session="$(session_from_output "$harness" "$out")"; [ -n "$session" ] && mf_update --arg s "$session" '.pm.session = $s'; fi
+  text="${pfile%.txt}.md"; result_text "$harness" "$out" > "$text"
+  parse_verdict "$text"
+}
+
+# ---------------------------------------------------------------------------
+# Candidate environments (delegated to worktree-add / worktree-remove)
+# ---------------------------------------------------------------------------
+agents_env_for() { # harness model -> "K=V;K=V" or empty
+  [ -n "$2" ] || return 0
+  case "$1" in
+    claude)   printf 'CC_MODEL_MAIN=%s;CC_MODEL_NORMAL=%s' "$2" "$2" ;;
+    opencode) printf 'OC_MODEL_MAIN=%s;OC_MODEL_NORMAL=%s' "$2" "$2" ;;
+  esac
+}
+
+create_candidate_env() { # label
+  local l="$1" args=()
+  args=(--project "$PROJECT" --tmp --name "$(cand_get "$l" '.env_name')" --db "$AI_ARENA_DB" -y)
+  [ -n "$AI_ARENA_BASE_REF" ] && args+=(--base-ref "$AI_ARENA_BASE_REF")
+  [ -n "$AI_ARENA_LOCAL_FILES" ] && args+=(--local-files "$AI_ARENA_LOCAL_FILES")
+  local ae; ae="$(agents_env_for "$(cand_get "$l" '.harness')" "$(cand_get "$l" '.model // empty')")"
+  [ -n "$ae" ] && args+=(--agents-env "$ae")
+  "$SCRIPT_DIR/worktree-add" "${args[@]}" "$(cand_get "$l" '.branch')" > /dev/null
+}
+
+remove_candidate_env() { # label keep_branch(0|1)
+  local env_dir branch args=()
+  env_dir="$(cand_get "$1" '.env_dir')"; branch="$(cand_get "$1" '.branch')"
+  case "$branch" in tmp/*) ;; *) die "refusing to delete branch '$branch': not tmp/*" ;; esac
+  case "$env_dir" in "$TMP_DIR/"*) ;; *) die "refusing to remove '$env_dir': not under $TMP_DIR" ;; esac
+  args=(--project "$PROJECT" --tmp-only -y -f); [ "$2" = "1" ] && args+=(--keep-branch)
+  if [ -d "$env_dir" ]; then
+    "$SCRIPT_DIR/worktree-remove" "${args[@]}" "$env_dir"
+  elif [ "$2" = "0" ] && git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$REPO_DIR" worktree prune; git -C "$REPO_DIR" branch -D "$branch" >/dev/null && log "deleted branch $branch"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Candidate run / wait
+# ---------------------------------------------------------------------------
+launch_candidate() { # label prompt_text resume(0|1)
+  local label="$1" prompt="$2" resume="$3" harness model session env_name env_dir container user cmd
+  harness="$(cand_get "$label" '.harness')"; model="$(cand_get "$label" '.model // empty')"; session="$(cand_get "$label" '.session // empty')"
+  env_name="$(cand_get "$label" '.env_name')"; env_dir="$(cand_get "$label" '.env_dir')"
+  [ -d "$env_dir" ] || die "candidate $label has no environment (ai-arena spawn $SLUG $label)"
+  user="$(harness_user "$harness")"; container="$(container_for "$harness" "$env_name")"
+  container_running "$container" || die "container $container is not running (cd $env_dir && ddev start)"
+  [ "$resume" = "1" ] || session=""
+  rm -f "$env_dir/arena-report.md" "$env_dir/arena-run.json" "$env_dir/arena-run.log" "$env_dir/arena-run.exit"
+  printf '%s\n' "$prompt" > "$env_dir/arena-prompt.txt"
+  cmd="$(harness_cmd "$harness" "$model" "$session" "$CONTAINER_ROOT/arena-prompt.txt")"
+  docker exec -d -u "$user" -w "$CONTAINER_ROOT" "$container" \
+    bash -c "{ $cmd; } > $CONTAINER_ROOT/arena-run.json 2> $CONTAINER_ROOT/arena-run.log; echo \$? > $CONTAINER_ROOT/arena-run.exit"
+  cand_set "$label" state running; cand_set "$label" started "$(now)"
+  log "candidate $label running in $container ($harness${model:+ $model}${session:+, resumed})"
+}
+
+settle_candidate() { # label -> prints new state
+  local label="$1" env_dir harness exit_code report status="" session
+  env_dir="$(cand_get "$label" '.env_dir')"; harness="$(cand_get "$label" '.harness')"
+  [ -f "$env_dir/arena-run.exit" ] || { echo running; return 0; }
+  exit_code="$(cat "$env_dir/arena-run.exit")"
+  session="$(session_from_output "$harness" "$env_dir/arena-run.json")"; [ -n "$session" ] && cand_set "$label" session "$session"
+  report="$env_dir/arena-report.md"
+  [ -f "$report" ] && status="$(grep -E '^STATUS:' "$report" | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+  case "$status" in DONE|BLOCKED|FAILED|PARTIAL) ;; *) status="FAILED" ;; esac
+  cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"; cand_set "$label" finished "$(now)"
+  echo "$status"
+}
+
+status_json() {
+  jq '{slug, status, description, coordinator, project, main_env, pm:{harness:.pm.harness, model:.pm.model, session:(.pm.session != null)},
+       candidates:[.candidates[] | {label, harness, model, branch, env_name, env_dir, state, exit_code, session:(.session != null), gates}], judge, winner}' "$MANIFEST"
+}
+
+status_table() {
+  printf '%-6s %-9s %-28s %-9s %-8s %s\n' LABEL HARNESS MODEL STATE GATES BRANCH
+  jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), .state,
+          (if .gates then ([.gates | to_entries[] | select(.key != "logs" and .key != "targets") | .value] | map(select(. == "fail")) | length | if . == 0 then "pass" else "fail" end) else "-" end),
+          .branch] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m s g b; do printf '%-6s %-9s %-28s %-9s %-8s %s\n' "$l" "$h" "$m" "$s" "$g" "$b"; done
+}
+
+# ---------------------------------------------------------------------------
+# Gates and collection
+# ---------------------------------------------------------------------------
+changed_files() { # wt_repo
+  { git -C "$1" diff --name-only HEAD; git -C "$1" ls-files --others --exclude-standard; } 2>/dev/null | grep -vE '^(arena-|arena/)' | sort -u
+}
+
+run_gate() { # env_dir container_dir logfile cmd... -> pass|fail
+  local env="$1" cdir="$2" logf="$3"; shift 3
+  if (cd "$env" && ddev exec -d "$cdir" "$@") > "$logf" 2>&1; then echo pass; else echo fail; fi
+}
+
+gate_candidate() { # label
+  local label="$1" env_dir wt_repo cdir gdir site phpstan="skip" phpcs="skip" phpunit="skip" targets docroot t
+  env_dir="$(cand_get "$label" '.env_dir')"; wt_repo="$env_dir/$REPO_REL"; cdir="$CONTAINER_ROOT/$REPO_REL"
+  gdir="$ARENA_DIR/candidates/$label/gates"; mkdir -p "$gdir"
+  log "gates for $label"
+  site="fail"; (cd "$env_dir" && ddev drush status --field=bootstrap) 2>"$gdir/site.log" | grep -q Successful && site="pass"
+  changed_files "$wt_repo" > "$gdir/changed-files.txt"
+  targets="$(sed -nE 's#^(.*/)?((modules|themes|profiles)/custom/[^/]+)/.*#\2#p' "$gdir/changed-files.txt" | sort -u)"
+  docroot="$(sed -nE 's#^(.*/)?(modules|themes|profiles)/custom/[^/]+/.*#\1#p' "$gdir/changed-files.txt" | sort -u | head -n1)"
+  if [ -n "$targets" ]; then
+    local tpaths; tpaths="$(for t in $targets; do printf '%s%s ' "$docroot" "$t"; done)"
+    if (cd "$env_dir" && ddev exec -d "$cdir" test -x vendor/bin/phpstan) >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      phpstan="$(run_gate "$env_dir" "$cdir" "$gdir/phpstan.log" vendor/bin/phpstan analyse --no-progress --no-interaction $tpaths)"
+    fi
+    if (cd "$env_dir" && ddev exec -d "$cdir" test -x vendor/bin/phpcs) >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      phpcs="$(run_gate "$env_dir" "$cdir" "$gdir/phpcs.log" vendor/bin/phpcs --standard=Drupal,DrupalPractice --extensions=php,module,inc,install,test,profile,theme $tpaths)"
+    fi
+    if (cd "$env_dir" && ddev exec -d "$cdir" test -x vendor/bin/phpunit) >/dev/null 2>&1; then
+      local any=0 res
+      for t in $targets; do
+        [ -d "$wt_repo/$docroot$t/tests" ] || continue; any=1
+        if [ -f "$wt_repo/phpunit.xml" ] || [ -f "$wt_repo/phpunit.xml.dist" ]; then
+          res="$(run_gate "$env_dir" "$cdir" "$gdir/phpunit-$(basename "$t").log" vendor/bin/phpunit "$docroot$t/tests")"
+        else
+          res="$(run_gate "$env_dir" "$cdir" "$gdir/phpunit-$(basename "$t").log" env SIMPLETEST_DB=mysql://db:db@db/db SIMPLETEST_BASE_URL=http://localhost vendor/bin/phpunit -c "${docroot}core" "$docroot$t/tests")"
+        fi
+        [ "$res" = "fail" ] && phpunit="fail"; [ "$res" = "pass" ] && [ "$phpunit" != "fail" ] && phpunit="pass"
+      done
+      [ "$any" = "1" ] || phpunit="skip"
+    fi
+  fi
+  jq -n --arg site "$site" --arg phpstan "$phpstan" --arg phpcs "$phpcs" --arg phpunit "$phpunit" --arg logs "$gdir" --arg targets "$targets" \
+    '{site:$site, phpstan:$phpstan, phpcs:$phpcs, phpunit:$phpunit, targets:($targets | split("\n") | map(select(. != ""))), logs:$logs}' > "$gdir/../gates.json"
+  cand_set_json "$label" gates "$(jq 'del(.logs)' "$gdir/../gates.json")"
+  jq -c . "$gdir/../gates.json"
+}
+
+collect_candidate() { # label
+  local label="$1" env_dir wt_repo cdir f
+  env_dir="$(cand_get "$label" '.env_dir')"; wt_repo="$env_dir/$REPO_REL"; cdir="$ARENA_DIR/candidates/$label"; mkdir -p "$cdir"
+  {
+    git -C "$wt_repo" diff HEAD -- . ':(exclude)arena-*' 2>/dev/null || true
+    git -C "$wt_repo" ls-files --others --exclude-standard | grep -vE '^arena-' | while IFS= read -r f; do git -C "$wt_repo" diff --no-index -- /dev/null "$f" 2>/dev/null || true; done
+  } > "$cdir/diff.patch"
+  changed_files "$wt_repo" > "$cdir/files-changed.txt"
+  if [ -f "$env_dir/arena-report.md" ]; then cp "$env_dir/arena-report.md" "$cdir/report.md"; else printf 'STATUS: FAILED\n(no report written)\n' > "$cdir/report.md"; fi
+  [ -f "$env_dir/arena-run.log" ] && cp "$env_dir/arena-run.log" "$cdir/run.log"
+  # No harness or model information lands here: the judge stays blind.
+  log "collected $label: $(wc -l < "$cdir/files-changed.txt") file(s) changed"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  local ok=0 t c v
+  for t in git jq ddev docker; do command -v "$t" >/dev/null 2>&1 && echo "ok    $t: $(command -v "$t")" || { echo "MISSING $t"; ok=1; }; done
+  echo "ok    coordinator: $COORD at $PROJECT"
+  echo "ok    main environment: $MAIN_ENV (repo $REPO_REL/, base name $BASE)"
+  echo "ok    candidates: $TMP_DIR/${BASE}-tmp-* (branches tmp/*); promoted environments: $WT_DIR/"
+  [ -d "$PROMPTS_DIR" ] || { echo "MISSING prompts dir $PROMPTS_DIR"; ok=1; }
+  for t in claude opencode; do
+    c="$(container_for "$t" "$COORD")"
+    if container_running "$c"; then v="$(docker exec -u "$(harness_user "$t")" "$c" "$t" --version 2>/dev/null | head -n1 || echo '?')"; echo "ok    $t container: $c ($v)"
+    else echo "warn  $t container not running: $c (ai-arena up)"; fi
+  done
+  shopt -s nullglob; local snaps=("$MAIN_ENV"/.ddev/db_snapshots/baseline*); shopt -u nullglob
+  [ ${#snaps[@]} -gt 0 ] && echo "ok    db snapshot 'baseline' in the main environment" || echo "info  no 'baseline' snapshot: candidates use the newest backups/ dump or an export of main"
+  echo "info  free disk: $(df -h "$PROJECT" | awk 'NR==2{print $4}')"
+  return $ok
+}
+
+cmd_up() { log "ddev start ($COORD)"; (cd "$PROJECT" && ddev start -y); }
+
+cmd_init() {
+  local task="" candidates="$AI_ARENA_DEFAULT_CANDIDATES" pm="${AI_ARENA_PM_HARNESS}${AI_ARENA_PM_MODEL:+:$AI_ARENA_PM_MODEL}" description="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --candidates) candidates="$2"; shift 2 ;; --pm) pm="$2"; shift 2 ;; --description) description="$2"; shift 2 ;; --force) force=1; shift ;;
+      -*) die "unknown option $1" ;; *) [ -z "$task" ] && task="$1" || description="$description $1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: init \"<task>\" [--candidates a,b] [--pm harness[:model]] [--description \"...\"]"
+  [ -n "$description" ] || description="$task"
+  local slug dir; slug="$(slugify "$task")"; [ -n "$slug" ] || die "cannot derive a slug from '$task'"; dir="$(arena_dir "$slug")"
+  [ -f "$dir/manifest.json" ] && [ "$force" = "0" ] && die "arena '$slug' exists (use --force to recreate the manifest)"
+  mkdir -p "$dir/candidates" "$dir/pm"
+  local pm_harness="${pm%%:*}" pm_model=""; [ "$pm" != "$pm_harness" ] && pm_model="${pm#*:}"; harness_user "$pm_harness" >/dev/null
+  local specs=() spec i=0 label harness model cands="[]"
+  IFS=',' read -r -a specs <<< "$candidates"
+  [ ${#specs[@]} -le "$AI_ARENA_MAX_CANDIDATES" ] || die "too many candidates (${#specs[@]} > AI_ARENA_MAX_CANDIDATES=$AI_ARENA_MAX_CANDIDATES)"
+  for spec in "${specs[@]}"; do
+    spec="$(printf '%s' "$spec" | tr -d '[:space:]')"; [ -n "$spec" ] || continue
+    harness="${spec%%:*}"; model=""; [ "$spec" != "$harness" ] && model="${spec#*:}"; harness_user "$harness" >/dev/null
+    label="$(printf "\\$(printf '%03o' $((97 + i)))")"
+    cands="$(jq --arg l "$label" --arg h "$harness" --arg m "$model" --arg b "tmp/$slug-$label" --arg n "${BASE}-tmp-${slug}-${label}" --arg d "$TMP_DIR/${BASE}-tmp-${slug}-${label}" \
+      '. + [{label:$l, harness:$h, model:(if $m=="" then null else $m end), branch:$b, env_name:$n, env_dir:$d, state:"init", session:null, gates:null}]' <<< "$cands")"
+    i=$((i + 1))
+  done
+  [ "$i" -gt 0 ] || die "no candidates"
+  jq -n --arg slug "$slug" --arg task "$task" --arg description "$description" --arg created "$(now)" --arg ph "$pm_harness" --arg pm "$pm_model" \
+    --arg coord "$COORD" --arg project "$PROJECT" --arg main "$MAIN_ENV" --arg repo "$REPO_REL" --argjson c "$cands" \
+    '{slug:$slug, task:$task, description:$description, status:"init", created:$created, coordinator:$coord, project:$project, main_env:$main, repo_rel:$repo,
+      pm:{harness:$ph, model:(if $pm=="" then null else $pm end), session:null}, candidates:$c, judge:null, winner:null}' > "$dir/manifest.json"
+  log "arena '$slug' created with $i candidate(s): $dir"
+  echo "$slug"
+}
+
+cmd_plan() {
+  mf_require "$1"; shift
+  local description="${1:-$(mf_get '.description')}" msg
+  msg="$(fill_prompt plan.md)"; msg="${msg//\{\{TASK\}\}/$description}"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
+  pm_call "$msg"
+  [ -s "$ARENA_DIR/brief.md" ] || die "the PM did not write $ARENA_DIR/brief.md (see arena/$SLUG/pm/*.log)"
+  mf_update '.status = "planned"'; log "brief written: $ARENA_DIR/brief.md"
+}
+
+cmd_spawn() {
+  mf_require "$1"; shift
+  local l
+  for l in $(resolve_labels "$@"); do
+    guard_label "$l"
+    [ "$(cand_get "$l" '.state')" = "init" ] || { warn "candidate $l is not in state init; skipping"; continue; }
+    create_candidate_env "$l"; cand_set "$l" state ready; log "candidate $l ready: $(cand_get "$l" '.env_dir')"
+  done
+  mf_update '.status = "spawned"'
+}
+
+cmd_run() {
+  mf_require "$1"; shift
+  [ -s "$ARENA_DIR/brief.md" ] || die "no brief (ai-arena plan $SLUG)"
+  # Inside a candidate's own container the repo sits at /var/www/html/<repo>, not at the coordinator path.
+  local l prompt env_dir; prompt="$(sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/candidate.md")"
+  for l in $(resolve_labels "$@"); do
+    guard_label "$l"
+    case "$(cand_get "$l" '.state')" in ready|DONE|BLOCKED|FAILED|PARTIAL) ;; running) warn "$l already running"; continue ;; *) warn "$l not ready"; continue ;; esac
+    env_dir="$(cand_get "$l" '.env_dir')"; cp "$ARENA_DIR/brief.md" "$env_dir/arena-brief.md"; launch_candidate "$l" "$prompt" 0
+  done
+  mf_update '.status = "running"'
+}
+
+cmd_resume() {
+  mf_require "$1"; shift
+  local l="$1" msg="${2:-}"; guard_label "$l"; [ -n "$msg" ] || die "usage: resume <slug> <label> \"<message>\""
+  [ -n "$(cand_get "$l" '.session // empty')" ] || die "candidate $l has no session to resume"
+  launch_candidate "$l" "$msg"$'\n\n'"When done, rewrite $CONTAINER_ROOT/arena-report.md (STATUS first line) as before." 1
+}
+
+cmd_wait() {
+  mf_require "$1"; shift
+  local all=0 timeout="$AI_ARENA_TIMEOUT" interval=15 start l st changed
+  while [ $# -gt 0 ]; do case "$1" in --all) all=1; shift ;; --timeout) timeout="$2"; shift 2 ;; --interval) interval="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  start="$(date +%s)"
+  while :; do
+    changed=0
+    for l in $(labels); do
+      [ "$(cand_get "$l" '.state')" = "running" ] || continue
+      st="$(settle_candidate "$l")"; [ "$st" = "running" ] || { changed=1; log "candidate $l -> $st"; }
+    done
+    [ "$changed" = "1" ] && [ "$all" = "0" ] && break
+    jq -e '.candidates[] | select(.state=="running")' "$MANIFEST" >/dev/null || break
+    if [ "$timeout" -gt 0 ] && [ $(( $(date +%s) - start )) -ge "$timeout" ]; then status_json; die "timeout after ${timeout}s with candidates still running"; fi
+    sleep "$interval"
+  done
+  status_json
+}
+
+cmd_status() {
+  mf_require "$1"; shift
+  local l; for l in $(labels); do [ "$(cand_get "$l" '.state')" = "running" ] && settle_candidate "$l" >/dev/null; done
+  if [ "${1:-}" = "--json" ]; then status_json; else echo "arena: $SLUG ($(mf_get '.status'))  task: $(mf_get '.task')"; status_table; fi
+}
+
+cmd_pm() { mf_require "$1"; shift; [ -n "${1:-}" ] || die "usage: pm <slug> \"<message>\""; pm_call "$1"; }
+
+cmd_gate() { mf_require "$1"; shift; local l; for l in $(resolve_labels "$@"); do guard_label "$l"; [ -d "$(cand_get "$l" '.env_dir')" ] || { warn "$l has no environment"; continue; }; gate_candidate "$l"; done; }
+
+cmd_collect() { mf_require "$1"; shift; local l; for l in $(labels); do [ -d "$(cand_get "$l" '.env_dir')" ] || continue; collect_candidate "$l"; done; mf_update '.status = "collected"'; }
+
+cmd_judge() {
+  mf_require "$1"; shift
+  ls "$ARENA_DIR"/candidates/*/report.md >/dev/null 2>&1 || die "nothing collected (ai-arena collect $SLUG)"
+  local msg out; msg="$(fill_prompt judge.md)"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
+  out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.judge = $j | .status = "judged"'; printf '%s\n' "$out"
+}
+
+cmd_promote() {
+  mf_require "$1"; shift
+  local l="$1"; shift; guard_label "$l"
+  local target="feature/$SLUG" env=0
+  while [ $# -gt 0 ]; do case "$1" in --branch) target="$2"; shift 2 ;; --env) env=1; shift ;; *) die "unknown option $1" ;; esac; done
+  local src; src="$(cand_get "$l" '.branch')"
+  git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$src" || die "branch $src does not exist"
+  git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$target" && die "branch $target already exists"
+  git -C "$REPO_DIR" branch "$target" "$src"
+  mf_update --arg w "$l" --arg t "$target" '.winner = {label:$w, branch:$t} | .status = "promoted"'
+  log "created $target from $src (candidate $l)"
+  if [ "$env" = "1" ]; then
+    local d; d="$("$SCRIPT_DIR/worktree-add" --project "$PROJECT" --db "$AI_ARENA_DB" -y "$target" | tail -n1)"
+    mf_update --arg d "$d" '.winner.env_dir = $d'; log "environment ready: $d"
+  fi
+}
+
+cmd_reveal() {
+  mf_require "$1"; shift
+  local winner; winner="$(mf_get '.winner.label // .judge.winner // empty')"
+  echo "arena: $SLUG   winner: ${winner:-(none yet)}"
+  printf '%-6s %-9s %s\n' LABEL HARNESS MODEL
+  jq -r '.candidates[] | [.label, .harness, (.model // "(default)")] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m; do printf '%-6s %-9s %s\n' "$l" "$h" "$m"; done
+  if [ -n "$winner" ]; then
+    mkdir -p "$(dirname "$WINS_LOG")"; [ -f "$WINS_LOG" ] || printf 'ts\tproject\tslug\twinner\tharness\tmodel\tcandidates\n' > "$WINS_LOG"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$COORD" "$SLUG" "$winner" "$(cand_get "$winner" '.harness')" "$(cand_get "$winner" '.model // "(default)"')" \
+      "$(jq -r '[.candidates[] | .harness + ":" + (.model // "default")] | join(",")' "$MANIFEST")" >> "$WINS_LOG"
+    log "logged to $WINS_LOG"
+  fi
+}
+
+cmd_clean() {
+  mf_require "$1"; shift
+  local keep="" purge=0 l winner keep_branch
+  while [ $# -gt 0 ]; do case "$1" in --keep) keep="$2"; shift 2 ;; --purge) purge=1; shift ;; *) die "unknown option $1" ;; esac; done
+  winner="$(mf_get '.winner.label // empty')"
+  for l in $(labels); do
+    keep_branch=0; { [ "$l" = "$keep" ] || [ "$l" = "$winner" ]; } && keep_branch=1
+    [ "$(cand_get "$l" '.state')" = "running" ] && { warn "candidate $l is still running; skipping"; continue; }
+    remove_candidate_env "$l" "$keep_branch"; cand_set "$l" state cleaned
+  done
+  mf_update '.status = "cleaned"'
+  [ "$purge" = "1" ] && { rm -rf "$ARENA_DIR"; log "purged $ARENA_DIR"; }
+  return 0
+}
+
+cmd_list() { local m; shopt -s nullglob; for m in "$PROJECT"/arena/*/manifest.json; do jq -r '"\(.slug)\t\(.status)\t\(.candidates | length) candidates\t\(.task)"' "$m"; done; shopt -u nullglob; }
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+PROJECT=""
+while [ $# -gt 0 ]; do case "$1" in --project) PROJECT="$2"; shift 2 ;; *) break ;; esac; done
+cmd="${1:-}"; shift || true
+case "$cmd" in ""|-h|--help|help) usage; exit 0 ;; --version) echo "$VERSION"; exit 0 ;; esac
+need git; need jq; need ddev; need docker
+resolve_project
+case "$cmd" in
+  doctor) cmd_doctor ;; up) cmd_up ;; init) cmd_init "$@" ;; plan) cmd_plan "$@" ;; spawn) cmd_spawn "$@" ;; run) cmd_run "$@" ;;
+  wait) cmd_wait "$@" ;; status) cmd_status "$@" ;; resume) cmd_resume "$@" ;; pm) cmd_pm "$@" ;; gate) cmd_gate "$@" ;;
+  collect) cmd_collect "$@" ;; judge) cmd_judge "$@" ;; promote) cmd_promote "$@" ;; reveal) cmd_reveal "$@" ;; clean) cmd_clean "$@" ;; list) cmd_list ;;
+  *) die "unknown command '$cmd' (see ai-arena --help)" ;;
+esac

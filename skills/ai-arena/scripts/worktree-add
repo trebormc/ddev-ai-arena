@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Create a DDEV environment from a git worktree of the project's main environment.
+#
+# Project layout (the "coordinator" directory, usually projects/<name>/):
+#
+#   <project>/
+#   ├── .ddev/            coordinator DDEV project (AI containers only, no Drupal)
+#   ├── backups/          database dumps (optional; newest "-latest" file wins)
+#   ├── main/             MAIN environment: .ddev/ + <repo>/ (its .git is a directory)
+#   ├── worktree/         real branch environments (siblings of main, same shape)
+#   └── worktree-tmp/     temporary environments (arena candidates), disposable
+#
+# The main environment may also live at worktree/<base>/ (legacy layout); it is
+# recognised because its repository's .git is a directory, while worktrees have a
+# .git file.
+#
+# The new environment is a copy of the main environment (everything except the
+# repo), with the generated DDEV state cleaned, `name:` and pinned ports removed,
+# a git worktree of the requested branch inside, the untracked local dev config
+# copied over (settings.local.php, development.services.yml, ...), DDEV started,
+# composer install, the database provisioned (baseline snapshot, newest backup,
+# an export of main, or nothing), and drush cr / updb / cim / cim.
+#
+# Usage: worktree-add [options] <branch>
+#   --project <dir>       coordinator directory (default: current directory)
+#   --tmp                 create under worktree-tmp/ instead of worktree/
+#   --name <env-name>     DDEV project/env name (default: <base>-<branch with / as ->)
+#   --agents-env <lines>  lines appended to .ddev/.env.agents BEFORE ddev start,
+#                         separated by ';' (e.g. "CC_MODEL_MAIN=opus;CC_MODEL_NORMAL=opus")
+#   --db <mode>           snapshot | latest | file:<path> | export | none
+#                         (default: snapshot, then latest, then export)
+#   --base-ref <ref>      start point for a NEW branch (default: HEAD of the main repo)
+#   --no-provision        skip composer install and the drush steps
+#   --local-files <specs> extra git pathspecs of untracked files to copy, ';'-separated
+#   --replace             remove an existing environment with the same name first
+#   -y                    no confirmation prompts
+#
+# Prints the created environment directory as the LAST line of stdout.
+set -euo pipefail
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project="$PWD"; tmp=0; name=""; agents_env=""; db="auto"; base_ref=""; provision=1; local_specs=""; replace=0; yes=0
+branch=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) project="$2"; shift 2 ;;
+    --tmp) tmp=1; shift ;;
+    --name) name="$2"; shift 2 ;;
+    --agents-env) agents_env="$2"; shift 2 ;;
+    --db) db="$2"; shift 2 ;;
+    --base-ref) base_ref="$2"; shift 2 ;;
+    --no-provision) provision=0; shift ;;
+    --local-files) local_specs="$2"; shift 2 ;;
+    --replace) replace=1; shift ;;
+    -y) yes=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) [ -z "$branch" ] && branch="$1" || die "unexpected argument $1"; shift ;;
+  esac
+done
+[ -n "$branch" ] || { usage >&2; exit 1; }
+command -v ddev >/dev/null 2>&1 || die "'ddev' is not on the PATH"
+project="$(cd "$project" && pwd)"
+
+# shellcheck source=lib.sh
+. "$SCRIPT_DIR/lib.sh"
+locate_main_env "$project"   # sets MAIN_ENV, REPO_REL, REPO_DIR, BASE
+
+parent="$project/worktree"; [ "$tmp" = "1" ] && parent="$project/worktree-tmp"
+[ -n "$name" ] || name="${BASE}-$(printf '%s' "$branch" | tr '/' '-')"
+dest="$parent/$name"
+wt_repo="$dest/$REPO_REL"
+
+log "main environment: $MAIN_ENV (repo: $REPO_REL, base name: $BASE)"
+
+if [ -e "$dest" ]; then
+  if [ "$replace" = "1" ]; then
+    log "$dest exists: removing it first"
+    "$SCRIPT_DIR/worktree-remove" --project "$project" -y -f "$dest"
+  else
+    die "$dest already exists (use --replace to recreate it)"
+  fi
+fi
+
+log "creating environment: $dest"
+mkdir -p "$dest"
+
+# Copy everything from the main environment except the repo and arena artefacts.
+shopt -s dotglob nullglob
+for item in "$MAIN_ENV"/*; do
+  n="$(basename "$item")"
+  case "$n" in "$REPO_REL"|arena|arena-*) continue ;; esac
+  cp -a "$item" "$dest/"
+done
+shopt -u dotglob nullglob
+
+clean_ddev_state "$dest/.ddev"
+sed -i -E '/^name:[[:space:]]/d; /^host_(db|webserver|https)_port:[[:space:]]/d' "$dest/.ddev/config.yaml"
+printf 'name: %s\n' "$name" >> "$dest/.ddev/config.yaml"
+
+# Baseline snapshot from main (hardlink, copy as fallback).
+shopt -s nullglob
+snapshots=("$MAIN_ENV"/.ddev/db_snapshots/baseline*)
+shopt -u nullglob
+if [ ${#snapshots[@]} -gt 0 ]; then
+  mkdir -p "$dest/.ddev/db_snapshots"
+  for s in "${snapshots[@]}"; do
+    ln "$s" "$dest/.ddev/db_snapshots/$(basename "$s")" 2>/dev/null || cp -a "$s" "$dest/.ddev/db_snapshots/"
+  done
+fi
+
+# Git worktree on the requested branch: existing local, remote-tracking, or new.
+log "git worktree add ($branch)"
+if git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
+  git -C "$REPO_DIR" worktree add "$wt_repo" "$branch"
+elif git -C "$REPO_DIR" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+  git -C "$REPO_DIR" worktree add --track -b "$branch" "$wt_repo" "origin/$branch"
+else
+  log "branch '$branch' does not exist: creating it from ${base_ref:-HEAD}"
+  git -C "$REPO_DIR" worktree add -b "$branch" "$wt_repo" "${base_ref:-HEAD}"
+fi
+
+copy_local_files "$REPO_DIR" "$wt_repo" "$local_specs"
+
+if [ -n "$agents_env" ]; then
+  mkdir -p "$dest/.ddev"
+  { printf '\n# added by worktree-add\n'; printf '%s\n' "$agents_env" | tr ';' '\n'; } >> "$dest/.ddev/.env.agents"
+  log "appended model overrides to .ddev/.env.agents"
+fi
+
+log "ddev start ($name)"
+(cd "$dest" && ddev start -y)
+
+if [ "$provision" = "1" ]; then
+  log "composer install"
+  (cd "$dest" && ddev composer install --no-interaction) || warn "composer install failed"
+fi
+
+# Database.
+db_ready=0
+try_snapshot() {
+  [ ${#snapshots[@]} -gt 0 ] || return 1
+  log "restoring snapshot 'baseline' from the main environment"
+  (cd "$dest" && ddev snapshot restore baseline)
+}
+try_latest() {
+  local f
+  f="$(newest_backup "$project")" || return 1
+  log "importing newest backup: $f"
+  (cd "$dest" && ddev import-db --file="$f") && (cd "$dest" && ddev drush sql:sanitize -y)
+}
+try_export() {
+  local dump="$project/.ai-arena-db.sql.gz"
+  if [ ! -f "$dump" ] || [ -n "$(find "$dump" -mmin +720 2>/dev/null)" ]; then
+    log "exporting the main environment's database"
+    (cd "$MAIN_ENV" && ddev export-db --file="$dump" --gzip)
+  fi
+  log "importing $dump"
+  (cd "$dest" && ddev import-db --file="$dump")
+}
+case "$db" in
+  none) db_ready=0 ;;
+  snapshot) try_snapshot && db_ready=1 ;;
+  latest) try_latest && db_ready=1 ;;
+  file:*) f="${db#file:}"; [ -f "$f" ] || die "database file not found: $f"; log "importing $f"; (cd "$dest" && ddev import-db --file="$f") && db_ready=1 ;;
+  export) try_export && db_ready=1 ;;
+  auto) { try_snapshot || try_latest || try_export; } && db_ready=1 ;;
+  *) die "unknown --db mode '$db'" ;;
+esac
+
+if [ "$db_ready" = "1" ] && [ "$provision" = "1" ]; then
+  for step in "drush cr" "drush updb -y" "drush cim -y" "drush cim -y"; do
+    log "ddev $step"
+    # shellcheck disable=SC2086
+    (cd "$dest" && ddev $step) || warn "step failed: ddev $step"
+  done
+elif [ "$db_ready" = "0" ] && [ "$db" != "none" ]; then
+  warn "no database provisioned; the environment is up with an empty database"
+fi
+
+log "ready: $dest (https://${name}.ddev.site)"
+printf '%s\n' "$dest"

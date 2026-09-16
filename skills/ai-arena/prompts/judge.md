@@ -1,13 +1,14 @@
 JUDGE the arena "{{SLUG}}".
 
 Candidates (blind labels): {{CANDIDATES}}
-For each label L the host collected, in this project's mount:
-- {{ARENA}}/candidates/L/diff.patch      the full change (tracked diff + new files)
-- {{ARENA}}/candidates/L/report.md       the candidate's own report (STATUS first line)
-- {{ARENA}}/candidates/L/gates.json      mechanical gates: site, phpstan, phpcs, phpunit (pass|fail|skip)
-- {{ARENA}}/candidates/L/gates/*.log     gate logs
-- {{ARENA}}/candidates/L/files-changed.txt
-The brief they all worked from: {{ARENA}}/brief.md. The repository root is {{REPO}}.
+Judge ONLY from the collected copies under {{ARENA}}/candidates/L/ for each label L:
+- diff.patch          the full change (tracked diff + new files)
+- report.md           the candidate's own report (STATUS first line)
+- gates.json          mechanical gates: site, phpstan, phpcs, phpunit (pass|fail|skip)
+- gates/*.log         gate logs
+- files-changed.txt
+The brief they all worked from: {{ARENA}}/brief.md. The main repository (unchanged base) is {{REPO}}.
+Do not open the live candidate environments ({{LIVE}}) for this step: they reveal which model produced which label, and the judgment must stay blind.
 
 Follow the JUDGE rules of the **arena-protocol** skill:
 1. Gates first. A candidate with a failed gate cannot win over one with all gates passing, whatever the prose says. Read the gate logs before trusting a report.
