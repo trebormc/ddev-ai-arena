@@ -71,6 +71,9 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 
 # Main environment when it is not <project>/main or <project>/worktree/<x>.
 #AI_ARENA_MAIN_ENV=
+
+# Reviewer panel for `ai-arena review`: comma-separated "harness[:model]".
+#AI_ARENA_REVIEWERS=claude:opus,opencode
 EOF
   echo "wrote $HOME/.ddev/ai-arena/config.env (defaults, all commented)"
 fi

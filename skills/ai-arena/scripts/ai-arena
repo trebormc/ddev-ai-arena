@@ -36,6 +36,7 @@ AI_ARENA_BASE_REF=""
 AI_ARENA_DB="auto"
 AI_ARENA_LOCAL_FILES=""
 AI_ARENA_MAIN_ENV=""
+AI_ARENA_REVIEWERS="claude:opus,opencode"
 
 log()  { printf '==> %s\n' "$*" >&2; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -72,6 +73,8 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   reveal <slug>                            Label -> harness/model, log the win
   clean <slug> [--keep label] [--purge]    Delete candidate environments and tmp/ branches
   list                                     Arenas in this project
+  review (--branch <b> | --env <dir> | --patch <file>) [--reviewers a,b] [--intent "..."] [--timeout S]
+                                           Multi-model review of one diff: independent reviewers, then a lead synthesis
 
 Config: ~/.ddev/ai-arena/config.env (all projects), <project>/ai-arena.env (this project)
 EOF
@@ -545,6 +548,102 @@ cmd_clean() {
 
 cmd_list() { local m; shopt -s nullglob; for m in "$PROJECT"/arena/*/manifest.json; do jq -r '"\(.slug)\t\(.status)\t\(.candidates | length) candidates\t\(.task)"' "$m"; done; shopt -u nullglob; }
 
+
+# ---------------------------------------------------------------------------
+# Review: N independent reviewers on one diff (different harnesses/models), then a lead synthesis
+# ---------------------------------------------------------------------------
+review_launch() { # harness model label dir prompt_text -> detached run in the coordinator's container
+  local harness="$1" model="$2" label="$3" dir="$4" prompt="$5" user container cmd cdir
+  user="$(harness_user "$harness")"; container="$(container_for "$harness" "$COORD")"
+  container_running "$container" || die "container $container is not running (ai-arena up)"
+  cdir="$CONTAINER_ROOT/${dir#"$PROJECT"/}"
+  printf '%s\n' "$prompt" > "$dir/$label-prompt.txt"
+  rm -f "$dir/$label-run.json" "$dir/$label-run.log" "$dir/$label-run.exit" "$dir/$label.md"
+  cmd="$(harness_cmd "$harness" "$model" "" "$cdir/$label-prompt.txt")"
+  docker exec -d -u "$user" -w "$CONTAINER_ROOT" "$container" \
+    bash -c "{ $cmd; } > $cdir/$label-run.json 2> $cdir/$label-run.log; echo \$? > $cdir/$label-run.exit"
+  log "reviewer $label running in $container ($harness${model:+ $model})"
+}
+
+cmd_review() {
+  local branch="" env="" patch="" reviewers="$AI_ARENA_REVIEWERS" intent="" timeout="$AI_ARENA_TIMEOUT"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) branch="${2:?}"; shift 2 ;; --env) env="${2:?}"; shift 2 ;; --patch) patch="${2:?}"; shift 2 ;;
+      --reviewers) reviewers="${2:?}"; shift 2 ;; --intent) intent="${2:?}"; shift 2 ;; --timeout) timeout="${2:?}"; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [ -n "$branch$env$patch" ] || die "usage: review (--branch <b> | --env <dir> | --patch <file>) [--reviewers a,b] [--intent \"...\"]"
+  local id dir tree_c
+  id="review-$(date +%Y%m%d-%H%M%S)"; dir="$PROJECT/arena/reviews/$id"; mkdir -p "$dir"
+  # The diff, and the tree reviewers may read for context (as the coordinator container sees it).
+  if [ -n "$branch" ]; then
+    git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$branch" || die "branch $branch does not exist in $REPO_DIR"
+    git -C "$REPO_DIR" diff "$(git -C "$REPO_DIR" merge-base HEAD "$branch")" "$branch" > "$dir/diff.patch"
+    tree_c="$CONTAINER_REPO"; [ -n "$intent" ] || intent="$(git -C "$REPO_DIR" log --format=%s "$(git -C "$REPO_DIR" merge-base HEAD "$branch")..$branch" | head -n 20)"
+  elif [ -n "$env" ]; then
+    env="$(cd "$env" && pwd)"; local wt="$env/$REPO_REL"
+    [ -e "$wt/.git" ] || die "$wt is not a git checkout"
+    { git -C "$wt" diff HEAD 2>/dev/null || true
+      git -C "$wt" ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do git -C "$wt" diff --no-index -- /dev/null "$f" 2>/dev/null || true; done
+    } > "$dir/diff.patch"
+    case "$env" in "$PROJECT"/*) tree_c="$CONTAINER_ROOT/${env#"$PROJECT"/}/$REPO_REL" ;; *) tree_c="$CONTAINER_REPO" ;; esac
+    [ -n "$intent" ] || intent="Working tree of $env"
+  else
+    [ -f "$patch" ] || die "patch file not found: $patch"; cp "$patch" "$dir/diff.patch"; tree_c="$CONTAINER_REPO"
+    [ -n "$intent" ] || intent="Patch $(basename "$patch")"
+  fi
+  [ -s "$dir/diff.patch" ] || die "empty diff: nothing to review"
+  printf '%s\n' "$intent" > "$dir/intent.txt"
+  log "review $id: $(grep -c '^diff --git' "$dir/diff.patch") file(s) in the diff"
+  # Fan out the reviewers (labels r1, r2, ...) in parallel, each blind to the others.
+  local specs=() spec i=0 label labels=() cdir prompt
+  IFS=',' read -r -a specs <<< "$reviewers"
+  cdir="$CONTAINER_ROOT/${dir#"$PROJECT"/}"
+  for spec in ${specs[@]+"${specs[@]}"}; do
+    spec="$(printf '%s' "$spec" | tr -d '[:space:]')"; [ -n "$spec" ] || continue
+    local harness="${spec%%:*}" model=""; [ "$spec" != "$harness" ] && model="${spec#*:}"; harness_user "$harness" >/dev/null
+    i=$((i + 1)); label="r$i"; labels+=("$label")
+    prompt="$(sed -e "s|{{DIFF}}|$cdir/diff.patch|g" -e "s|{{INTENT}}|$cdir/intent.txt|g" -e "s|{{TREE}}|$tree_c|g" -e "s|{{OUT}}|$cdir/$label.md|g" "$PROMPTS_DIR/review.md")"
+    review_launch "$harness" "$model" "$label" "$dir" "$prompt"
+    jq -n --arg l "$label" --arg h "$harness" --arg m "$model" '{label:$l, harness:$h, model:(if $m=="" then null else $m end)}' >> "$dir/reviewers.jsonl"
+  done
+  [ "$i" -gt 0 ] || die "no reviewers"
+  # Wait for every reviewer.
+  local start pending l
+  start="$(date +%s)"
+  while :; do
+    pending=0
+    for l in "${labels[@]}"; do [ -f "$dir/$l-run.exit" ] || pending=$((pending + 1)); done
+    [ "$pending" = "0" ] && break
+    if [ "$timeout" -gt 0 ] && [ $(( $(date +%s) - start )) -ge "$timeout" ]; then die "timeout: $pending reviewer(s) still running in $dir"; fi
+    sleep 10
+  done
+  for l in "${labels[@]}"; do
+    if [ ! -s "$dir/$l.md" ]; then
+      local h; h="$(jq -r --arg l "$l" 'select(.label==$l) | .harness' "$dir/reviewers.jsonl" | head -n1)"
+      result_text "$h" "$dir/$l-run.json" > "$dir/$l.md" 2>/dev/null || true
+      [ -s "$dir/$l.md" ] || printf 'NO REVIEW PRODUCED (exit %s)\n' "$(cat "$dir/$l-run.exit")" > "$dir/$l.md"
+    fi
+    log "reviewer $l: $(grep -c -E '^\s*-\s|^[0-9]+\.' "$dir/$l.md" || true) lines of findings"
+  done
+  # Lead synthesis in the PM harness (blind to which model wrote which review).
+  local harness model user container pfile out logf cmd
+  harness="$AI_ARENA_PM_HARNESS"; model="$AI_ARENA_PM_MODEL"; user="$(harness_user "$harness")"; container="$(container_for "$harness" "$COORD")"
+  container_running "$container" || die "container $container is not running (ai-arena up)"
+  { sed -e "s|{{DIFF}}|$cdir/diff.patch|g" -e "s|{{INTENT}}|$cdir/intent.txt|g" -e "s|{{TREE}}|$tree_c|g" -e "s|{{VERDICT}}|$cdir/verdict.md|g" -e "s|{{REVIEWS}}|$(printf '%s ' "${labels[@]/#/$cdir/}" | sed 's/ $//; s|\([^ ]*\)|\1.md|g')|g" "$PROMPTS_DIR/review-lead.md"; } > "$dir/lead-prompt.txt"
+  pfile="$cdir/lead-prompt.txt"; out="$dir/lead-run.json"; logf="$dir/lead-run.log"
+  cmd="$(harness_cmd "$harness" "$model" "" "$pfile")"
+  log "lead synthesis ($harness${model:+ $model}) ..."
+  docker exec -u "$user" -w "$CONTAINER_ROOT" "$container" bash -c "$cmd" < /dev/null > "$out" 2> "$logf" || warn "lead call exited non-zero; see $logf"
+  [ -s "$dir/verdict.md" ] || result_text "$harness" "$out" > "$dir/verdict.md" 2>/dev/null || true
+  echo "review: $dir"
+  echo "reviewers: $(jq -r '[.label + "=" + .harness + ":" + (.model // "default")] | join(" ")' "$dir/reviewers.jsonl" | tr '\n' ' ')"
+  echo "---"
+  cat "$dir/verdict.md"
+}
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -557,6 +656,6 @@ resolve_project
 case "$cmd" in
   doctor) cmd_doctor ;; up) cmd_up ;; init) cmd_init "$@" ;; plan) cmd_plan "$@" ;; spawn) cmd_spawn "$@" ;; run) cmd_run "$@" ;;
   wait) cmd_wait "$@" ;; status) cmd_status "$@" ;; resume) cmd_resume "$@" ;; pm) cmd_pm "$@" ;; gate) cmd_gate "$@" ;;
-  collect) cmd_collect "$@" ;; judge) cmd_judge "$@" ;; promote) cmd_promote "$@" ;; reveal) cmd_reveal "$@" ;; clean) cmd_clean "$@" ;; list) cmd_list ;;
+  collect) cmd_collect "$@" ;; judge) cmd_judge "$@" ;; promote) cmd_promote "$@" ;; reveal) cmd_reveal "$@" ;; clean) cmd_clean "$@" ;; list) cmd_list ;; review) cmd_review "$@" ;;
   *) die "unknown command '$cmd' (see ai-arena --help)" ;;
 esac

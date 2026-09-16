@@ -16,6 +16,7 @@ description: >-
   - user: "¿cómo va la arena?" -> ai-arena status, summarise
   - user: "crea un entorno para la rama feature/DREP-123" -> worktree-add feature/DREP-123
   - user: "elimina el entorno de la rama feature/DREP-123" -> worktree-remove feature/DREP-123
+  - user: "revisa la rama feature/x con varios modelos" -> ai-arena review --branch feature/x
   Never use for tasks that fit in one file or one command (run them directly), and
   never create, start, or delete DDEV projects, worktrees, or branches by hand: only
   through the scripts of this skill.
@@ -93,6 +94,15 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
 10. **Clean.** `ai-arena clean <slug>` removes the candidates under `worktree-tmp/`
     and their `tmp/*` branches (the winner's branch is kept). Ask the user only if a
     candidate is still running or they asked to keep losers.
+
+## Multi-model review (no arena)
+
+`ai-arena review --branch <b> | --env <dir> | --patch <file> [--reviewers claude:opus,opencode] [--intent "..."]`
+runs independent reviewers on different harnesses and models in the coordinator's
+containers and a lead synthesis; it prints the verdict and leaves everything under
+`arena/reviews/<id>/`. Use it when the user asks for a review, a second opinion, or
+"tear this apart" on a branch or an environment's working tree. Report the Act-on list
+first, then Consider, and name which reviews agreed.
 
 ## Ordinary environments (no arena)
 

@@ -130,6 +130,22 @@ ai-arena clean add-a-handling-fee
 | `reveal <slug>` | Label → harness/model, appends to the wins log |
 | `clean <slug> [--keep label] [--purge]` | Deletes candidates under `worktree-tmp/` and their `tmp/*` branches; refuses when the judge picked a winner that was not promoted yet |
 | `list` | Arenas in this project |
+| `review (--branch <b> \| --env <dir> \| --patch <file>) [--reviewers a,b] [--intent "..."]` | Multi-model review of one diff: independent reviewers on different harnesses/models in the coordinator's containers, then a lead synthesis (act on / consider / noted / dismissed); no worktrees needed |
+
+### Multi-model review
+
+The cheapest use of the coordinator: review one diff with several models and let a lead
+synthesize. No candidate environments, no database; reviewers read the diff and the
+code from the coordinator's mount.
+
+```bash
+ai-arena review --branch feature/add-a-handling-fee --reviewers claude:opus,claude:sonnet,opencode
+ai-arena review --env worktree/atlas-feature-x --intent "cache the listing per role"
+```
+
+Reviews land in `arena/reviews/<id>/` (`diff.patch`, one `rN.md` per reviewer,
+`verdict.md`). Reviewers are blind to each other; the lead does not know which model
+wrote which review. Default panel: `AI_ARENA_REVIEWERS` in the config.
 
 ### Ordinary environments
 
