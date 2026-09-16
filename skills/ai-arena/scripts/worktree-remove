@@ -7,19 +7,20 @@
 #   --tmp-only        refuse anything outside <project>/worktree-tmp/
 #   --keep-branch     do not delete the git branch
 #   -y                no confirmation prompt
-#   -f                force worktree removal even with uncommitted changes
+#   -f                force: remove a worktree with uncommitted changes and delete
+#                     the branch even when it has unmerged commits
 set -euo pipefail
 
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
 log()  { printf '==> %s\n' "$*" >&2; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 project="$PWD"; tmp_only=0; keep_branch=0; yes=0; force=0; target=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --project) project="$2"; shift 2 ;;
+    --project) project="${2:?}"; shift 2 ;;
     --tmp-only) tmp_only=1; shift ;;
     --keep-branch) keep_branch=1; shift ;;
     -y) yes=1; shift ;;
@@ -30,6 +31,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$target" ] || { usage >&2; exit 1; }
+[ -d "$project" ] || die "no such directory: $project"
 project="$(cd "$project" && pwd)"
 
 # shellcheck source=lib.sh
@@ -41,8 +43,7 @@ dest=""
 if [ -d "$target" ]; then
   dest="$(cd "$target" && pwd)"
 else
-  n="$target"
-  case "$n" in */*) n="${BASE}-$(printf '%s' "$n" | tr '/' '-')" ;; esac
+  n="$(ddev_safe_name "$target")"
   for cand in "$project/worktree-tmp/$n" "$project/worktree/$n" "$project/worktree-tmp/${BASE}-$n" "$project/worktree/${BASE}-$n"; do
     [ -d "$cand" ] && { dest="$cand"; break; }
   done
@@ -52,7 +53,7 @@ fi
 case "$dest" in "$project/worktree-tmp/"*|"$project/worktree/"*) ;; *) die "'$dest' is outside $project/worktree-tmp and $project/worktree; refusing" ;; esac
 if [ "$tmp_only" = "1" ]; then case "$dest" in "$project/worktree-tmp/"*) ;; *) die "'$dest' is not under worktree-tmp (--tmp-only)" ;; esac; fi
 
-env_name="$(sed -nE 's/^name:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$dest/.ddev/config.yaml" 2>/dev/null | head -n1 || true)"
+env_name="$(ddev_name "$dest")"
 [ -n "$env_name" ] || env_name="$(basename "$dest")"
 wt_repo="$dest/$REPO_REL"
 branch=""
@@ -72,7 +73,7 @@ ddev delete -Oy "$env_name" >/dev/null 2>&1 || warn "ddev delete failed or proje
 
 if [ -e "$wt_repo/.git" ]; then
   flags=(); [ "$force" = "1" ] && flags+=(--force)
-  if ! git -C "$REPO_DIR" worktree remove "${flags[@]}" "$wt_repo"; then
+  if ! git -C "$REPO_DIR" worktree remove ${flags[@]+"${flags[@]}"} "$wt_repo"; then
     die "git refused to remove the worktree (uncommitted changes?). Review them or repeat with -f"
   fi
 fi
@@ -82,7 +83,12 @@ log "removing $dest"
 rm -rf "$dest"
 
 if [ "$keep_branch" = "0" ] && [ -n "$branch" ] && [ "$branch" != "HEAD" ] && git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$branch"; then
-  git -C "$REPO_DIR" branch -D "$branch" >/dev/null && log "deleted branch $branch"
+  del="-d"; [ "$force" = "1" ] && del="-D"
+  if git -C "$REPO_DIR" branch "$del" "$branch" >/dev/null 2>&1; then
+    log "deleted branch $branch"
+  else
+    warn "branch $branch kept: it has unmerged commits (repeat with -f to delete it anyway)"
+  fi
 fi
 
 log "environment '$env_name' removed"

@@ -15,16 +15,18 @@
 # .git file.
 #
 # The new environment is a copy of the main environment (everything except the
-# repo), with the generated DDEV state cleaned, `name:` and pinned ports removed,
-# a git worktree of the requested branch inside, the untracked local dev config
-# copied over (settings.local.php, development.services.yml, ...), DDEV started,
-# composer install, the database provisioned (baseline snapshot, newest backup,
-# an export of main, or nothing), and drush cr / updb / cim / cim.
+# repo and the snapshots), with the generated DDEV state cleaned, `name:`, pinned
+# ports and extra hostnames removed, a git worktree of the requested branch inside,
+# the untracked local dev config copied over (settings.local.php,
+# development.services.yml, ...), DDEV started, composer install, the database
+# provisioned (baseline snapshot, newest backup, an export of main, or nothing),
+# and drush cr / updb / cim / cim. A failure before DDEV is up removes the
+# half-built directory again.
 #
 # Usage: worktree-add [options] <branch>
 #   --project <dir>       coordinator directory (default: current directory)
 #   --tmp                 create under worktree-tmp/ instead of worktree/
-#   --name <env-name>     DDEV project/env name (default: <base>-<branch with / as ->)
+#   --name <env-name>     DDEV project/env name (default: <base>-<branch, sanitised>)
 #   --agents-env <lines>  lines appended to .ddev/.env.agents BEFORE ddev start,
 #                         separated by ';' (e.g. "CC_MODEL_MAIN=opus;CC_MODEL_NORMAL=opus")
 #   --db <mode>           snapshot | latest | file:<path> | export | none
@@ -37,25 +39,26 @@
 #
 # Prints the created environment directory as the LAST line of stdout.
 set -euo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; }
 log()  { printf '==> %s\n' "$*" >&2; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 project="$PWD"; tmp=0; name=""; agents_env=""; db="auto"; base_ref=""; provision=1; local_specs=""; replace=0; yes=0
 branch=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --project) project="$2"; shift 2 ;;
+    --project) project="${2:?}"; shift 2 ;;
     --tmp) tmp=1; shift ;;
-    --name) name="$2"; shift 2 ;;
-    --agents-env) agents_env="$2"; shift 2 ;;
-    --db) db="$2"; shift 2 ;;
-    --base-ref) base_ref="$2"; shift 2 ;;
+    --name) name="${2:?}"; shift 2 ;;
+    --agents-env) agents_env="${2:?}"; shift 2 ;;
+    --db) db="${2:?}"; shift 2 ;;
+    --base-ref) base_ref="${2:?}"; shift 2 ;;
     --no-provision) provision=0; shift ;;
-    --local-files) local_specs="$2"; shift 2 ;;
+    --local-files) local_specs="${2:?}"; shift 2 ;;
     --replace) replace=1; shift ;;
     -y) yes=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -65,6 +68,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$branch" ] || { usage >&2; exit 1; }
 command -v ddev >/dev/null 2>&1 || die "'ddev' is not on the PATH"
+[ -d "$project" ] || die "no such directory: $project"
 project="$(cd "$project" && pwd)"
 
 # shellcheck source=lib.sh
@@ -72,7 +76,8 @@ project="$(cd "$project" && pwd)"
 locate_main_env "$project"   # sets MAIN_ENV, REPO_REL, REPO_DIR, BASE
 
 parent="$project/worktree"; [ "$tmp" = "1" ] && parent="$project/worktree-tmp"
-[ -n "$name" ] || name="${BASE}-$(printf '%s' "$branch" | tr '/' '-')"
+[ -n "$name" ] || name="${BASE}-$(ddev_safe_name "$branch")"
+[ "$name" = "$(ddev_safe_name "$name")" ] || die "'$name' is not a valid DDEV project name (lowercase letters, digits and hyphens)"
 dest="$parent/$name"
 wt_repo="$dest/$REPO_REL"
 
@@ -87,21 +92,52 @@ if [ -e "$dest" ]; then
   fi
 fi
 
+# Until DDEV is up, a failure removes what was built so the next run starts clean.
+started=0
+cleanup_on_error() {
+  local rc=$?
+  trap - ERR EXIT
+  [ "$rc" = "0" ] && exit 0
+  warn "failed (exit $rc); removing the half-built environment $dest"
+  [ "$started" = "1" ] && ddev delete -Oy "$name" >/dev/null 2>&1 || true
+  if [ -e "$wt_repo/.git" ]; then git -C "$REPO_DIR" worktree remove --force "$wt_repo" >/dev/null 2>&1 || true; fi
+  git -C "$REPO_DIR" worktree prune >/dev/null 2>&1 || true
+  rm -rf "$dest"
+  exit "$rc"
+}
+trap cleanup_on_error ERR EXIT
+
 log "creating environment: $dest"
 mkdir -p "$dest"
 
-# Copy everything from the main environment except the repo and arena artefacts.
+# Copy everything from the main environment except the repo, arena artefacts and
+# the snapshots (copied selectively below: they can weigh gigabytes).
 shopt -s dotglob nullglob
 for item in "$MAIN_ENV"/*; do
   n="$(basename "$item")"
-  case "$n" in "$REPO_REL"|arena|arena-*) continue ;; esac
-  cp -a "$item" "$dest/"
+  case "$n" in "$REPO_REL"|arena|arena-*|.ai-arena-db.sql.gz) continue ;; esac
+  if [ "$n" = ".ddev" ]; then
+    mkdir -p "$dest/.ddev"
+    for sub in "$item"/*; do
+      case "$(basename "$sub")" in db_snapshots|traefik) continue ;; esac
+      cp -a "$sub" "$dest/.ddev/"
+    done
+  else
+    cp -a "$item" "$dest/"
+  fi
 done
 shopt -u dotglob nullglob
 
 clean_ddev_state "$dest/.ddev"
-sed -i -E '/^name:[[:space:]]/d; /^host_(db|webserver|https)_port:[[:space:]]/d' "$dest/.ddev/config.yaml"
-printf 'name: %s\n' "$name" >> "$dest/.ddev/config.yaml"
+# Drop the keys that would collide with the main environment: name, pinned host
+# ports, and the extra hostnames/FQDNs (multi-line lists).
+awk '
+  /^(name|host_db_port|host_webserver_port|host_https_port):[[:space:]]/ { next }
+  /^(additional_hostnames|additional_fqdns):/ { skip = 1; next }
+  skip && /^[[:space:]]+-/ { next }
+  { skip = 0; print }
+' "$dest/.ddev/config.yaml" > "$dest/.ddev/config.yaml.tmp" && mv "$dest/.ddev/config.yaml.tmp" "$dest/.ddev/config.yaml"
+printf '\nname: %s\n' "$name" >> "$dest/.ddev/config.yaml"
 
 # Baseline snapshot from main (hardlink, copy as fallback).
 shopt -s nullglob
@@ -135,6 +171,9 @@ fi
 
 log "ddev start ($name)"
 (cd "$dest" && ddev start -y)
+started=1
+# From here on the environment is usable: keep it on failure and let the user decide.
+trap - ERR EXIT
 
 if [ "$provision" = "1" ]; then
   log "composer install"
@@ -158,7 +197,8 @@ try_export() {
   local dump="$project/.ai-arena-db.sql.gz"
   if [ ! -f "$dump" ] || [ -n "$(find "$dump" -mmin +720 2>/dev/null)" ]; then
     log "exporting the main environment's database"
-    (cd "$MAIN_ENV" && ddev export-db --file="$dump" --gzip)
+    (cd "$MAIN_ENV" && ddev export-db --file="$dump.part" --gzip) || { rm -f "$dump.part"; return 1; }
+    mv "$dump.part" "$dump"
   fi
   log "importing $dump"
   (cd "$dest" && ddev import-db --file="$dump")

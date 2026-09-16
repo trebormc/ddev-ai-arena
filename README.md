@@ -75,7 +75,7 @@ Once on the host:
 
 ```bash
 git clone https://github.com/trebormc/ddev-ai-arena.git
-cd ddev-ai-arena && ./install.sh     # copies the skill to ~/.claude/skills and ~/.config/opencode/skills, links ~/.local/bin/ai-arena
+cd ddev-ai-arena && ./install.sh     # copies the skill to ~/.claude/skills and ~/.config/opencode/skills, links ai-arena, worktree-add and worktree-remove into ~/.local/bin
 ```
 
 Once per project, create the coordinator:
@@ -89,7 +89,7 @@ ai-arena doctor
 ```
 
 The coordinator's name must differ from the main environment's DDEV name (the base for
-candidate names). Move your main environment to `main/` (or leave it under
+candidate names); `ai-arena doctor` fails when they collide. Move your main environment to `main/` (or leave it under
 `worktree/<base>/`: it is recognised because its repository's `.git` is a directory).
 
 ## Usage
@@ -119,16 +119,16 @@ ai-arena clean add-a-handling-fee
 | `plan <slug>` | PM session runs `code-review` PLAN mode over `main/<repo>` and writes the brief |
 | `spawn <slug> [label...]` | `worktree-add --tmp` per candidate: worktree, DDEV project, DB, composer, provisioning |
 | `run <slug> [label...]` | Starts candidates detached on the brief |
-| `wait <slug> [--all] [--timeout S]` | Blocks until a state change; prints JSON |
+| `wait <slug> [--all] [--timeout S] [--interval S]` | Blocks until a state change (poll every `--interval` seconds, default 15); prints JSON |
 | `status <slug> [--json]` | Candidate states, gates, branches |
 | `resume <slug> <label> "<msg>"` | Continues a candidate's session (answers, new instructions) |
 | `pm <slug> "<msg>"` | Talks to the PM session; prints its parsed verdict |
 | `gate <slug> [label...]` | Site bootstrap, PHPStan, PHPCS, PHPUnit on changed custom modules, inside each candidate |
 | `collect <slug>` | Diffs, reports, gates into `arena/<slug>/candidates/` (no model info) |
 | `judge <slug>` | PM judges blind: gates, rubric, conformance, then quality |
-| `promote <slug> <label> [--branch] [--env]` | `feature/<slug>` from the winner, optionally its environment under `worktree/` |
+| `promote <slug> <label> [--branch] [--env]` | Records the candidate's working tree as one commit on its `tmp/` branch (candidates never commit), then creates `feature/<slug>` from it; `--env` also creates its environment under `worktree/` |
 | `reveal <slug>` | Label → harness/model, appends to the wins log |
-| `clean <slug> [--keep label] [--purge]` | Deletes candidates under `worktree-tmp/` and their `tmp/*` branches |
+| `clean <slug> [--keep label] [--purge]` | Deletes candidates under `worktree-tmp/` and their `tmp/*` branches; refuses when the judge picked a winner that was not promoted yet |
 | `list` | Arenas in this project |
 
 ### Ordinary environments
@@ -162,7 +162,7 @@ coordinator's Playwright, a candidate's site is reachable at `http://ddev-<env_n
   never edited or removed, and its database is never touched.
 - The judge works from collected copies with no model information; live candidate
   directories are for answering questions only.
-- No commits, no pushes: the winner is a local branch you review and commit.
+- No pushes, and the only commit the tool ever makes is `promote` recording the winner's working tree on its `tmp/` branch (candidates never commit); `feature/<slug>` is a local branch you review, squash or amend, and push yourself.
 - Candidates are told: no Beads, no git writes, only the brief's paths.
 
 ## Configuration
@@ -185,7 +185,7 @@ models are applied through each environment's `.ddev/.env.agents` (the cascade
 | [ddev-beads](https://github.com/trebormc/ddev-beads) | [Beads](https://github.com/steveyegge/beads) git-backed task tracker. | Candidates skip it; the main environment keeps the task |
 | [ddev-playwright-mcp](https://github.com/trebormc/ddev-playwright-mcp) | Headless Playwright browser. | Candidates verify on their own browser; the coordinator can open their sites |
 | [ddev-ai-ssh](https://github.com/trebormc/ddev-ai-ssh) | SSH access to the web container. | Each environment gets its own keys |
-| [drupal-ai-agents](https://github.com/trebormc/drupal-ai-agents) | 11 agents, 17 rules, 38 skills for Drupal development. | Provides the `arena-protocol` skill |
+| [drupal-ai-agents](https://github.com/trebormc/drupal-ai-agents) | 11 agents, 15 rules, 39 skills for Drupal development. | Provides the `arena-protocol` skill |
 
 ## Disclaimer
 

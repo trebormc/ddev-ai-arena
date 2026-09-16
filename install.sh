@@ -31,10 +31,12 @@ first=""
 [ "$do_opencode" = "1" ] && { install_to "$HOME/.config/opencode/skills/ai-arena"; first="${first:-$HOME/.config/opencode/skills/ai-arena}"; }
 
 if [ "$do_bin" = "1" ]; then
-  target="${first:-$SRC}/scripts/ai-arena"
   mkdir -p "$HOME/.local/bin"
-  ln -sfn "$target" "$HOME/.local/bin/ai-arena"
-  echo "linked $HOME/.local/bin/ai-arena -> $target"
+  for tool in ai-arena worktree-add worktree-remove; do
+    target="${first:-$SRC}/scripts/$tool"
+    ln -sfn "$target" "$HOME/.local/bin/$tool"
+    echo "linked $HOME/.local/bin/$tool -> $target"
+  done
   case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "note: add $HOME/.local/bin to your PATH" ;; esac
 fi
 

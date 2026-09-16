@@ -117,8 +117,10 @@ anything skipped. Keep model names out of the judgment narrative until reveal.
   arenas can run at once; each has its own slug, sessions, and candidates.
 - Never edit files inside `main/`, `worktree/`, or `worktree-tmp/`; talk to
   candidates through `resume`.
-- Never run git write commands (commit, push, branch deletion) yourself; `promote`,
-  `clean`, and `worktree-remove` are the only branch operations.
+- Never run git write commands (commit, push, branch deletion) yourself; `promote`
+  (which records the winner's working tree as one commit on its `tmp/` branch, since
+  candidates never commit), `clean`, and `worktree-remove` are the only git operations.
+  Tell the user the branch carries one work-in-progress commit to review and squash.
 - If `wait` times out or this session is interrupted, `ai-arena status <slug>`
   reattaches: candidates ran detached and their state is on disk.
 - Questions to the user are the exception. Most BLOCKED questions are answered by

@@ -15,9 +15,10 @@
 # step is a deterministic subcommand, so the host agent picks verbs and reads JSON.
 # Only worktree-tmp/ environments and tmp/* branches are ever deleted.
 set -euo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
 
 VERSION="0.2.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PROMPTS_DIR="$SCRIPT_DIR/../prompts"
 CONTAINER_ROOT="/var/www/html"
 WINS_LOG="${HOME}/.ddev/ai-arena/wins.tsv"
@@ -58,7 +59,8 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   plan <slug> ["description"]              PM session writes arena/<slug>/brief.md
   spawn <slug> [label...]                  Create candidate environments (worktree-add --tmp)
   run <slug> [label...]                    Start candidates (detached) on the brief
-  wait <slug> [--all] [--timeout S]        Block until a candidate changes state (or all finish)
+  wait <slug> [--all] [--timeout S] [--interval S]
+                                           Block until a candidate changes state (or all finish)
   status <slug> [--json]                   Show candidate states
   resume <slug> <label> "<message>"        Continue a candidate's session with a message
   pm <slug> "<message>"                    Send a message to the PM session, print its verdict
@@ -101,14 +103,21 @@ resolve_project() {
 arena_dir() { printf '%s/arena/%s' "$PROJECT" "$1"; }
 
 mf_require() {
-  SLUG="$1"
+  SLUG="${1:-}"; [ -n "$SLUG" ] || die "missing <slug> (see ai-arena list)"
   ARENA_DIR="$(arena_dir "$SLUG")"
   MANIFEST="$ARENA_DIR/manifest.json"
   [ -f "$MANIFEST" ] || die "no arena '$SLUG' (expected $MANIFEST). Run: ai-arena init"
   CONTAINER_ARENA="$CONTAINER_ROOT/arena/$SLUG"
 }
 mf_get() { jq -r "$1" "$MANIFEST"; }
-mf_update() { local tmp; tmp="$(mktemp)"; jq "$@" "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"; }
+mf_update() {
+  local tmp
+  (
+    flock 9
+    tmp="$(mktemp "$MANIFEST.XXXXXX")"; chmod 644 "$tmp"
+    jq "$@" "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+  ) 9> "$MANIFEST.lock"
+}
 cand_get() { jq -r --arg l "$1" ".candidates[] | select(.label==\$l) | $2" "$MANIFEST"; }
 cand_set() { mf_update --arg l "$1" --arg k "$2" --arg v "$3" '(.candidates[] | select(.label==$l))[$k] = $v | .updated = (now | todate)'; }
 cand_set_json() { mf_update --arg l "$1" --arg k "$2" --argjson v "$3" '(.candidates[] | select(.label==$l))[$k] = $v'; }
@@ -136,20 +145,20 @@ harness_cmd() { # harness model session prompt_file_in_container
   case "$harness" in
     claude)
       cmd="claude -p --output-format json --permission-mode bypassPermissions"
-      [ -n "$model" ] && cmd="$cmd --model '$model'"
-      [ -n "$session" ] && cmd="$cmd --resume '$session'" ;;
+      [ -n "$model" ] && cmd="$cmd --model $(printf '%q' "$model")"
+      [ -n "$session" ] && cmd="$cmd --resume $(printf '%q' "$session")" ;;
     opencode)
       cmd="opencode run --format json"
-      [ -n "$model" ] && cmd="$cmd -m '$model'"
-      [ -n "$session" ] && cmd="$cmd -s '$session'" ;;
+      [ -n "$model" ] && cmd="$cmd -m $(printf '%q' "$model")"
+      [ -n "$session" ] && cmd="$cmd -s $(printf '%q' "$session")" ;;
   esac
   printf '%s "$(cat %s)"' "$cmd" "$pfile"
 }
 
 session_from_output() { # harness file
   case "$1" in
-    claude) jq -r 'if type=="array" then (.[] | select(.session_id?) | .session_id) else (.session_id // empty) end' "$2" 2>/dev/null | head -n1 ;;
-    opencode) grep -o '"sessionID":"[^"]*"' "$2" 2>/dev/null | head -n1 | cut -d'"' -f4 ;;
+    claude) { jq -r 'if type=="array" then (.[] | select(.session_id?) | .session_id) else (.session_id // empty) end' "$2" 2>/dev/null || true; } | head -n1 || true ;;
+    opencode) { grep -o '"sessionID":"[^"]*"' "$2" 2>/dev/null || true; } | head -n1 | cut -d'"' -f4 || true ;;
   esac
 }
 
@@ -189,7 +198,7 @@ pm_call() { # message -> prints JSON verdict; stores the session id
   if [ -z "$session" ]; then { fill_prompt pm.md; printf '\n\n%s\n' "$1"; } > "$pfile"; else printf '%s\n' "$1" > "$pfile"; fi
   cmd="$(harness_cmd "$harness" "$model" "$session" "$CONTAINER_ARENA/pm/$(basename "$pfile")")"
   log "pm ($harness${model:+ $model}${session:+, resumed}) ..."
-  docker exec -i -u "$user" -w "$CONTAINER_ROOT" "$container" bash -c "$cmd" > "$out" 2> "$logf" || warn "pm call exited non-zero; see $logf"
+  docker exec -u "$user" -w "$CONTAINER_ROOT" "$container" bash -c "$cmd" < /dev/null > "$out" 2> "$logf" || warn "pm call exited non-zero; see $logf"
   if [ -z "$session" ]; then session="$(session_from_output "$harness" "$out")"; [ -n "$session" ] && mf_update --arg s "$session" '.pm.session = $s'; fi
   text="${pfile%.txt}.md"; result_text "$harness" "$out" > "$text"
   parse_verdict "$text"
@@ -256,7 +265,7 @@ settle_candidate() { # label -> prints new state
   exit_code="$(cat "$env_dir/arena-run.exit")"
   session="$(session_from_output "$harness" "$env_dir/arena-run.json")"; [ -n "$session" ] && cand_set "$label" session "$session"
   report="$env_dir/arena-report.md"
-  [ -f "$report" ] && status="$(grep -E '^STATUS:' "$report" | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+  if [ -f "$report" ]; then status="$( { grep -E '^STATUS:' "$report" || true; } | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"; fi
   case "$status" in DONE|BLOCKED|FAILED|PARTIAL) ;; *) status="FAILED" ;; esac
   cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"; cand_set "$label" finished "$(now)"
   echo "$status"
@@ -278,7 +287,7 @@ status_table() {
 # Gates and collection
 # ---------------------------------------------------------------------------
 changed_files() { # wt_repo
-  { git -C "$1" diff --name-only HEAD; git -C "$1" ls-files --others --exclude-standard; } 2>/dev/null | grep -vE '^(arena-|arena/)' | sort -u
+  { git -C "$1" diff --name-only HEAD; git -C "$1" ls-files --others --exclude-standard; } 2>/dev/null | sort -u || true
 }
 
 run_gate() { # env_dir container_dir logfile cmd... -> pass|fail
@@ -329,13 +338,12 @@ collect_candidate() { # label
   local label="$1" env_dir wt_repo cdir f
   env_dir="$(cand_get "$label" '.env_dir')"; wt_repo="$env_dir/$REPO_REL"; cdir="$ARENA_DIR/candidates/$label"; mkdir -p "$cdir"
   {
-    git -C "$wt_repo" diff HEAD -- . ':(exclude)arena-*' 2>/dev/null || true
-    git -C "$wt_repo" ls-files --others --exclude-standard | grep -vE '^arena-' | while IFS= read -r f; do git -C "$wt_repo" diff --no-index -- /dev/null "$f" 2>/dev/null || true; done
+    git -C "$wt_repo" diff HEAD 2>/dev/null || true
+    git -C "$wt_repo" ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do git -C "$wt_repo" diff --no-index -- /dev/null "$f" 2>/dev/null || true; done
   } > "$cdir/diff.patch"
   changed_files "$wt_repo" > "$cdir/files-changed.txt"
   if [ -f "$env_dir/arena-report.md" ]; then cp "$env_dir/arena-report.md" "$cdir/report.md"; else printf 'STATUS: FAILED\n(no report written)\n' > "$cdir/report.md"; fi
-  [ -f "$env_dir/arena-run.log" ] && cp "$env_dir/arena-run.log" "$cdir/run.log"
-  # No harness or model information lands here: the judge stays blind.
+  # No harness or model information lands here (not even the harness log): the judge stays blind.
   log "collected $label: $(wc -l < "$cdir/files-changed.txt") file(s) changed"
 }
 
@@ -345,7 +353,7 @@ collect_candidate() { # label
 cmd_doctor() {
   local ok=0 t c v
   for t in git jq ddev docker; do command -v "$t" >/dev/null 2>&1 && echo "ok    $t: $(command -v "$t")" || { echo "MISSING $t"; ok=1; }; done
-  echo "ok    coordinator: $COORD at $PROJECT"
+  if [ "$COORD" = "$BASE" ]; then echo "FAIL  coordinator name '$COORD' equals the main environment's name; rename it (ddev config --project-name=${BASE}-arena)"; ok=1; else echo "ok    coordinator: $COORD at $PROJECT"; fi
   echo "ok    main environment: $MAIN_ENV (repo $REPO_REL/, base name $BASE)"
   echo "ok    candidates: $TMP_DIR/${BASE}-tmp-* (branches tmp/*); promoted environments: $WT_DIR/"
   [ -d "$PROMPTS_DIR" ] || { echo "MISSING prompts dir $PROMPTS_DIR"; ok=1; }
@@ -379,7 +387,7 @@ cmd_init() {
   local specs=() spec i=0 label harness model cands="[]"
   IFS=',' read -r -a specs <<< "$candidates"
   [ ${#specs[@]} -le "$AI_ARENA_MAX_CANDIDATES" ] || die "too many candidates (${#specs[@]} > AI_ARENA_MAX_CANDIDATES=$AI_ARENA_MAX_CANDIDATES)"
-  for spec in "${specs[@]}"; do
+  for spec in ${specs[@]+"${specs[@]}"}; do
     spec="$(printf '%s' "$spec" | tr -d '[:space:]')"; [ -n "$spec" ] || continue
     harness="${spec%%:*}"; model=""; [ "$spec" != "$harness" ] && model="${spec#*:}"; harness_user "$harness" >/dev/null
     label="$(printf "\\$(printf '%03o' $((97 + i)))")"
@@ -397,7 +405,7 @@ cmd_init() {
 }
 
 cmd_plan() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   local description="${1:-$(mf_get '.description')}" msg
   msg="$(fill_prompt plan.md)"; msg="${msg//\{\{TASK\}\}/$description}"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
   pm_call "$msg"
@@ -406,18 +414,19 @@ cmd_plan() {
 }
 
 cmd_spawn() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   local l
   for l in $(resolve_labels "$@"); do
     guard_label "$l"
-    [ "$(cand_get "$l" '.state')" = "init" ] || { warn "candidate $l is not in state init; skipping"; continue; }
-    create_candidate_env "$l"; cand_set "$l" state ready; log "candidate $l ready: $(cand_get "$l" '.env_dir')"
+    case "$(cand_get "$l" '.state')" in init|spawn-failed) ;; *) warn "candidate $l is not in state init; skipping"; continue ;; esac
+    if create_candidate_env "$l"; then cand_set "$l" state ready; log "candidate $l ready: $(cand_get "$l" '.env_dir')"
+    else cand_set "$l" state spawn-failed; warn "spawn failed for $l (fix the cause, then: ai-arena spawn $SLUG $l)"; fi
   done
   mf_update '.status = "spawned"'
 }
 
 cmd_run() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   [ -s "$ARENA_DIR/brief.md" ] || die "no brief (ai-arena plan $SLUG)"
   # Inside a candidate's own container the repo sits at /var/www/html/<repo>, not at the coordinator path.
   local l prompt env_dir; prompt="$(sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/candidate.md")"
@@ -430,14 +439,15 @@ cmd_run() {
 }
 
 cmd_resume() {
-  mf_require "$1"; shift
-  local l="$1" msg="${2:-}"; guard_label "$l"; [ -n "$msg" ] || die "usage: resume <slug> <label> \"<message>\""
+  mf_require "${1:-}"; shift || true
+  local l="${1:-}" msg="${2:-}"; [ -n "$l" ] && guard_label "$l"; [ -n "$l" ] && [ -n "$msg" ] || die "usage: resume <slug> <label> \"<message>\""
+  [ "$(cand_get "$l" '.state')" != "running" ] || die "candidate $l is still running (ai-arena wait $SLUG)"
   [ -n "$(cand_get "$l" '.session // empty')" ] || die "candidate $l has no session to resume"
   launch_candidate "$l" "$msg"$'\n\n'"When done, rewrite $CONTAINER_ROOT/arena-report.md (STATUS first line) as before." 1
 }
 
 cmd_wait() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   local all=0 timeout="$AI_ARENA_TIMEOUT" interval=15 start l st changed
   while [ $# -gt 0 ]; do case "$1" in --all) all=1; shift ;; --timeout) timeout="$2"; shift 2 ;; --interval) interval="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
   start="$(date +%s)"
@@ -456,32 +466,39 @@ cmd_wait() {
 }
 
 cmd_status() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   local l; for l in $(labels); do [ "$(cand_get "$l" '.state')" = "running" ] && settle_candidate "$l" >/dev/null; done
   if [ "${1:-}" = "--json" ]; then status_json; else echo "arena: $SLUG ($(mf_get '.status'))  task: $(mf_get '.task')"; status_table; fi
 }
 
-cmd_pm() { mf_require "$1"; shift; [ -n "${1:-}" ] || die "usage: pm <slug> \"<message>\""; pm_call "$1"; }
+cmd_pm() { mf_require "${1:-}"; shift || true; [ -n "${1:-}" ] || die "usage: pm <slug> \"<message>\""; pm_call "$1"; }
 
-cmd_gate() { mf_require "$1"; shift; local l; for l in $(resolve_labels "$@"); do guard_label "$l"; [ -d "$(cand_get "$l" '.env_dir')" ] || { warn "$l has no environment"; continue; }; gate_candidate "$l"; done; }
+cmd_gate() { mf_require "${1:-}"; shift || true; local l; for l in $(resolve_labels "$@"); do guard_label "$l"; [ -d "$(cand_get "$l" '.env_dir')" ] || { warn "$l has no environment"; continue; }; gate_candidate "$l"; done; }
 
-cmd_collect() { mf_require "$1"; shift; local l; for l in $(labels); do [ -d "$(cand_get "$l" '.env_dir')" ] || continue; collect_candidate "$l"; done; mf_update '.status = "collected"'; }
+cmd_collect() { mf_require "${1:-}"; shift || true; local l; for l in $(labels); do [ -d "$(cand_get "$l" '.env_dir')" ] || continue; collect_candidate "$l"; done; mf_update '.status = "collected"'; }
 
 cmd_judge() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   ls "$ARENA_DIR"/candidates/*/report.md >/dev/null 2>&1 || die "nothing collected (ai-arena collect $SLUG)"
   local msg out; msg="$(fill_prompt judge.md)"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
   out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.judge = $j | .status = "judged"'; printf '%s\n' "$out"
 }
 
 cmd_promote() {
-  mf_require "$1"; shift
-  local l="$1"; shift; guard_label "$l"
+  mf_require "${1:-}"; shift || true
+  local l="${1:-}"; [ -n "$l" ] || die "usage: promote <slug> <label> [--branch name] [--env]"; shift; guard_label "$l"
   local target="feature/$SLUG" env=0
-  while [ $# -gt 0 ]; do case "$1" in --branch) target="$2"; shift 2 ;; --env) env=1; shift ;; *) die "unknown option $1" ;; esac; done
-  local src; src="$(cand_get "$l" '.branch')"
+  while [ $# -gt 0 ]; do case "$1" in --branch) target="${2:?}"; shift 2 ;; --env) env=1; shift ;; *) die "unknown option $1" ;; esac; done
+  local src wt; src="$(cand_get "$l" '.branch')"; wt="$(cand_get "$l" '.env_dir')/$REPO_REL"
   git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$src" || die "branch $src does not exist"
   git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$target" && die "branch $target already exists"
+  # Candidates never commit: record their working tree on the tmp branch so the
+  # promoted branch carries the work (this is the only commit the tool ever makes).
+  if [ -d "$wt" ] && [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    git -C "$wt" add -A
+    git -C "$wt" -c user.name="ai-arena" -c user.email="ai-arena@localhost" commit -q -m "arena $SLUG: candidate $l (work in progress, review before merging)"
+    log "recorded candidate $l's working tree on $src"
+  fi
   git -C "$REPO_DIR" branch "$target" "$src"
   mf_update --arg w "$l" --arg t "$target" '.winner = {label:$w, branch:$t} | .status = "promoted"'
   log "created $target from $src (candidate $l)"
@@ -492,8 +509,10 @@ cmd_promote() {
 }
 
 cmd_reveal() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   local winner; winner="$(mf_get '.winner.label // .judge.winner // empty')"
+  case "$winner" in ""|none|NONE|None) winner="" ;; esac
+  if [ -n "$winner" ] && ! jq -e --arg l "$winner" '.candidates[] | select(.label==$l)' "$MANIFEST" >/dev/null; then warn "judge named '$winner', which is not a label"; winner=""; fi
   echo "arena: $SLUG   winner: ${winner:-(none yet)}"
   printf '%-6s %-9s %s\n' LABEL HARNESS MODEL
   jq -r '.candidates[] | [.label, .harness, (.model // "(default)")] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m; do printf '%-6s %-9s %s\n' "$l" "$h" "$m"; done
@@ -506,10 +525,14 @@ cmd_reveal() {
 }
 
 cmd_clean() {
-  mf_require "$1"; shift
+  mf_require "${1:-}"; shift || true
   local keep="" purge=0 l winner keep_branch
   while [ $# -gt 0 ]; do case "$1" in --keep) keep="$2"; shift 2 ;; --purge) purge=1; shift ;; *) die "unknown option $1" ;; esac; done
   winner="$(mf_get '.winner.label // empty')"
+  local judged; judged="$(mf_get '.judge.winner // empty')"; case "$judged" in none|NONE|None) judged="" ;; esac
+  if [ -z "$winner" ] && [ -n "$judged" ] && [ -z "$keep" ]; then
+    die "the judge picked '$judged' but nothing was promoted; run: ai-arena promote $SLUG $judged (or clean --keep $judged)"
+  fi
   for l in $(labels); do
     keep_branch=0; { [ "$l" = "$keep" ] || [ "$l" = "$winner" ]; } && keep_branch=1
     [ "$(cand_get "$l" '.state')" = "running" ] && { warn "candidate $l is still running; skipping"; continue; }

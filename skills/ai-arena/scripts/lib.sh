@@ -9,7 +9,8 @@ locate_main_env() { # project_dir
   local project="$1" d
   MAIN_ENV=""
   if [ -n "${AI_ARENA_MAIN_ENV:-}" ]; then
-    MAIN_ENV="$AI_ARENA_MAIN_ENV"
+    [ -d "$AI_ARENA_MAIN_ENV" ] || die "AI_ARENA_MAIN_ENV does not exist: $AI_ARENA_MAIN_ENV"
+    MAIN_ENV="$(cd "$AI_ARENA_MAIN_ENV" && pwd)"
   elif [ -d "$project/main/.ddev" ] && repo_subdir "$project/main" 1 >/dev/null; then
     MAIN_ENV="$project/main"
   else
@@ -21,10 +22,20 @@ locate_main_env() { # project_dir
   [ -n "$MAIN_ENV" ] || die "no main environment found: expected $project/main/ (or worktree/<x>/) with .ddev/ and a repo whose .git is a directory"
   REPO_REL="$(repo_subdir "$MAIN_ENV" 1)" || die "no repository subdirectory in $MAIN_ENV"
   REPO_DIR="$MAIN_ENV/$REPO_REL"
-  BASE=""
-  [ -f "$MAIN_ENV/.ddev/config.yaml" ] && BASE="$(sed -nE 's/^name:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$MAIN_ENV/.ddev/config.yaml" | head -n1 || true)"
+  BASE="$(ddev_name "$MAIN_ENV")"
   [ -n "$BASE" ] || BASE="$(basename "$MAIN_ENV")"
   [ "$BASE" != "main" ] || BASE="$(basename "$project")"
+}
+
+# The `name:` of a DDEV project directory's config.yaml, or nothing.
+ddev_name() { # env_dir
+  [ -f "$1/.ddev/config.yaml" ] || return 0
+  sed -nE 's/^name:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$1/.ddev/config.yaml" | head -n1 || true
+}
+
+# Lowercase, hyphen-only DDEV-safe name.
+ddev_safe_name() { # text
+  printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
 }
 
 # Name of the first subdirectory holding a git checkout. With "1" as second
@@ -43,20 +54,22 @@ repo_subdir() { # env_dir [require_git_dir]
 clean_ddev_state() { # ddev_dir
   local d="$1"
   rm -rf "$d"/.ddev-docker-compose-*.yaml "$d/.global_commands" "$d/.homeadditions" \
-         "$d/.dbimageBuild" "$d/.webimageBuild" "$d"/.importdb* "$d/db_snapshots" "$d/.agent-ssh-keys" 2>/dev/null || true
+         "$d/.dbimageBuild" "$d/.webimageBuild" "$d"/.importdb* "$d/db_snapshots" "$d/.agent-ssh-keys" \
+         "$d/traefik" 2>/dev/null || true
 }
 
 # Copy untracked/ignored local dev config from the main repo into a worktree.
 copy_local_files() { # src_repo dst_repo [extra_specs ';'-separated]
-  local src="$1" dst="$2" extra="${3:-}" rel n=0
+  local src="$1" dst="$2" extra="${3:-}" rel n=0 spec
   local patterns=('**/settings.local.php' '**/development.services.yml' '**/dev.services.yml'
                   '**/devel-twig.services.yml' '**/services.redis.yml' '**/.claude/settings.local.json'
                   '.claude/settings.local.json')
   if [ -n "$extra" ]; then
-    local IFS=';'
-    # shellcheck disable=SC2206
-    patterns+=($extra)
-    unset IFS
+    local extra_arr=()
+    set -f
+    IFS=';' read -r -a extra_arr <<< "$extra"
+    set +f
+    for spec in ${extra_arr[@]+"${extra_arr[@]}"}; do [ -n "$spec" ] && patterns+=("$spec"); done
   fi
   while IFS= read -r -d '' rel; do
     case "$rel" in vendor/*|*/vendor/*|node_modules/*|*/node_modules/*|*/core/*|*/files/*) continue ;; esac
