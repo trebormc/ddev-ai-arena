@@ -69,6 +69,14 @@ host: ai-arena ─┬─ up ─────────────▶ coordinat
                 └─ promote/clean ──▶ feature/<slug> (+ worktree/ env), worktree-tmp/ removed
 ```
 
+## Requirements
+
+**Linux only.** The scripts are developed and tested on Linux and rely on GNU tools and
+bash 4.4 or newer: `readlink -f`, `flock`, `iconv`, empty-array expansion, hardlinks
+for the snapshot copy. macOS ships bash 3.2 and BSD userland and is not supported; it
+may work with Homebrew bash and coreutils but nobody has tested it. Also needed:
+`ddev` 1.24.10+, `docker`, `git`, `jq`.
+
 ## Install
 
 Once on the host:

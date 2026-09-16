@@ -355,6 +355,8 @@ collect_candidate() { # label
 # ---------------------------------------------------------------------------
 cmd_doctor() {
   local ok=0 t c v
+  [ "$(uname -s)" = "Linux" ] && echo "ok    platform: Linux (bash $BASH_VERSION)" || { echo "warn  platform: $(uname -s) is untested; ai-arena is developed for Linux only"; }
+  for t in flock readlink iconv; do command -v "$t" >/dev/null 2>&1 || { echo "MISSING $t (GNU coreutils/util-linux)"; ok=1; }; done
   for t in git jq ddev docker; do command -v "$t" >/dev/null 2>&1 && echo "ok    $t: $(command -v "$t")" || { echo "MISSING $t"; ok=1; }; done
   if [ "$COORD" = "$BASE" ]; then echo "FAIL  coordinator name '$COORD' equals the main environment's name; rename it (ddev config --project-name=${BASE}-arena)"; ok=1; else echo "ok    coordinator: $COORD at $PROJECT"; fi
   echo "ok    main environment: $MAIN_ENV (repo $REPO_REL/, base name $BASE)"

@@ -9,6 +9,12 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/skills/ai-arena"
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "warning: ai-arena is developed and tested on Linux only (GNU tools, bash >= 4.4); $(uname -s) is unsupported." >&2
+fi
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 4 ]; }; then
+  echo "warning: bash ${BASH_VERSION} found; the scripts need bash 4.4 or newer." >&2
+fi
 do_claude=0; do_opencode=0; do_bin=0
 if [ $# -eq 0 ]; then do_claude=1; do_opencode=1; do_bin=1; fi
 for a in "$@"; do
