@@ -80,6 +80,9 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 
 # Reviewer panel for `ai-arena review`: comma-separated "harness[:model]".
 #AI_ARENA_REVIEWERS=claude:opus,opencode
+
+# Repository a candidate's short "@<branch>" agents pin refers to.
+#AI_ARENA_AGENTS_REPO=https://github.com/trebormc/drupal-ai-agents.git
 EOF
   echo "wrote $HOME/.ddev/ai-arena/config.env (defaults, all commented)"
 fi

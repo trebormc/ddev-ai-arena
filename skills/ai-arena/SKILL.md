@@ -50,7 +50,8 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
 1. **Bring up layer 2.** `ai-arena doctor`, then `ai-arena up` if the coordinator's
    containers are not running. Fix or report what doctor flags.
 2. **Init.** `ai-arena init "<task in the user's words>" [--candidates claude:opus,claude:sonnet,opencode] [--description "..."]`.
-   Prints the slug. Default panel and cap (max 3) come from `ai-arena.env`. Different
+   Prints the slug. To evaluate a change to the agents pack, pin the agents repo per
+   candidate with `@<branch>` (same model, same task: `claude:sonnet@main,claude:sonnet@feature/x`). Default panel and cap (max 3) come from `ai-arena.env`. Different
    harnesses and models per label are the point: keep the panel diverse unless the
    user names one.
 3. **Plan.** `ai-arena plan <slug>`. The PM session (coordinator container) runs
@@ -87,11 +88,16 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
    only. Read the ranking and graft suggestions. On `VERDICT: BLOCKED` (no acceptable
    candidate), report why and ask the user whether to resume the best one with the
    PM's instructions or stop.
-9. **Promote and reveal.** `ai-arena promote <slug> <winner> [--env]` creates
+9. **Review the winner (optional, recommended for security or data changes).**
+   `ai-arena review --env worktree-tmp/<winner env_name> --intent "<task>"` runs the
+   multi-model panel on the winner's working tree before it becomes a branch; put its
+   Act-on items to the user with the promotion decision, or resume the candidate with
+   them first.
+10. **Promote and reveal.** `ai-arena promote <slug> <winner> [--env]` creates
    `feature/<slug>` in the main repository (with `--env`, also its environment under
    `worktree/`). Then `ai-arena reveal <slug>` shows which harness and model each
    label was and logs the win to `~/.ddev/ai-arena/wins.tsv`.
-10. **Clean.** `ai-arena clean <slug>` removes the candidates under `worktree-tmp/`
+11. **Clean.** `ai-arena clean <slug>` removes the candidates under `worktree-tmp/`
     and their `tmp/*` branches (the winner's branch is kept). Ask the user only if a
     candidate is still running or they asked to keep losers.
 

@@ -29,6 +29,9 @@
 #   --name <env-name>     DDEV project/env name (default: <base>-<branch, sanitised>)
 #   --agents-env <lines>  lines appended to .ddev/.env.agents BEFORE ddev start,
 #                         separated by ';' (e.g. "CC_MODEL_MAIN=opus;CC_MODEL_NORMAL=opus")
+#   --agents-sync-env <lines>
+#                         same for .ddev/.env.agents-sync (e.g. "AGENTS_REPOS=<url>#<branch>");
+#                         an existing KEY= line is replaced, others are appended
 #   --db <mode>           snapshot | latest | file:<path> | export | none
 #                         (default: snapshot, then latest, then export)
 #   --base-ref <ref>      start point for a NEW branch (default: HEAD of the main repo)
@@ -47,7 +50,7 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-project="$PWD"; tmp=0; name=""; agents_env=""; db="auto"; base_ref=""; provision=1; local_specs=""; replace=0; yes=0
+project="$PWD"; tmp=0; name=""; agents_env=""; agents_sync_env=""; db="auto"; base_ref=""; provision=1; local_specs=""; replace=0; yes=0
 branch=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,6 +58,7 @@ while [ $# -gt 0 ]; do
     --tmp) tmp=1; shift ;;
     --name) name="${2:?}"; shift 2 ;;
     --agents-env) agents_env="${2:?}"; shift 2 ;;
+    --agents-sync-env) agents_sync_env="${2:?}"; shift 2 ;;
     --db) db="${2:?}"; shift 2 ;;
     --base-ref) base_ref="${2:?}"; shift 2 ;;
     --no-provision) provision=0; shift ;;
@@ -167,6 +171,17 @@ if [ -n "$agents_env" ]; then
   mkdir -p "$dest/.ddev"
   { printf '\n# added by worktree-add\n'; printf '%s\n' "$agents_env" | tr ';' '\n'; } >> "$dest/.ddev/.env.agents"
   log "appended model overrides to .ddev/.env.agents"
+fi
+
+if [ -n "$agents_sync_env" ]; then
+  f="$dest/.ddev/.env.agents-sync"; touch "$f"
+  printf '%s\n' "$agents_sync_env" | tr ';' '\n' | while IFS= read -r line; do
+    [ -n "$line" ] || continue; key="${line%%=*}"
+    if grep -qE "^${key}=" "$f"; then
+      awk -v k="$key" -v l="$line" 'index($0, k"=")==1 {print l; next} {print}' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    else printf '%s\n' "$line" >> "$f"; fi
+  done
+  log "set agents-sync overrides in .ddev/.env.agents-sync"
 fi
 
 log "ddev start ($name)"

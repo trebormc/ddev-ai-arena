@@ -131,14 +131,30 @@ ai-arena clean add-a-handling-fee
 | `status <slug> [--json]` | Candidate states, gates, branches |
 | `resume <slug> <label> "<msg>"` | Continues a candidate's session (answers, new instructions) |
 | `pm <slug> "<msg>"` | Talks to the PM session; prints its parsed verdict |
-| `gate <slug> [label...]` | Site bootstrap, PHPStan, PHPCS, PHPUnit on changed custom modules, inside each candidate |
+| `gate <slug> [label...]` | Site bootstrap, config (unexported config changes fail unless the brief says `Config changes: allowed`), PHPStan, PHPCS, PHPUnit on changed custom modules, inside each candidate |
 | `collect <slug>` | Diffs, reports, gates into `arena/<slug>/candidates/` (no model info) |
 | `judge <slug>` | PM judges blind: gates, rubric, conformance, then quality |
 | `promote <slug> <label> [--branch] [--env]` | Records the candidate's working tree as one commit on its `tmp/` branch (candidates never commit), then creates `feature/<slug>` from it; `--env` also creates its environment under `worktree/` |
-| `reveal <slug>` | Label → harness/model, appends to the wins log |
+| `reveal <slug>` | Label → harness/model/agents with cost and duration, appends to the wins log |
 | `clean <slug> [--keep label] [--purge]` | Deletes candidates under `worktree-tmp/` and their `tmp/*` branches; refuses when the judge picked a winner that was not promoted yet |
 | `list` | Arenas in this project |
 | `review (--branch <b> \| --env <dir> \| --patch <file>) [--reviewers a,b] [--intent "..."]` | Multi-model review of one diff: independent reviewers on different harnesses/models in the coordinator's containers, then a lead synthesis (act on / consider / noted / dismissed); no worktrees needed |
+
+### Evaluating a change to the agents pack
+
+A candidate is `harness[:model][@agents]`. The `@agents` part pins the agents repository
+that candidate syncs (a branch or tag of the default repo, or a full `url#ref`), so two
+candidates with the same model and task differ only in the agents, rules and skills they
+load:
+
+```bash
+ai-arena init "Add a handling fee" --candidates claude:sonnet@main,claude:sonnet@feature/new-rule
+```
+
+The branch must be pushed (the containers clone it). Same gates, same blind judge, and
+`reveal` shows which agents version each label ran, with its cost and duration, so the
+wins log becomes an evaluation record for the pack itself. `AI_ARENA_AGENTS_REPO` sets
+the default repository the short form refers to.
 
 ### Multi-model review
 

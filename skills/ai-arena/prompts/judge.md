@@ -4,7 +4,7 @@ Candidates (blind labels): {{CANDIDATES}}
 Judge ONLY from the collected copies under {{ARENA}}/candidates/L/ for each label L:
 - diff.patch          the full change (tracked diff + new files)
 - report.md           the candidate's own report (STATUS first line)
-- gates.json          mechanical gates: site, phpstan, phpcs, phpunit (pass|fail|skip)
+- gates.json          mechanical gates: site, config (unexported config changes the brief did not allow), phpstan, phpcs, phpunit (pass|fail|skip)
 - gates/*.log         gate logs
 - files-changed.txt
 The brief they all worked from: {{ARENA}}/brief.md. The main repository (unchanged base) is {{REPO}}.

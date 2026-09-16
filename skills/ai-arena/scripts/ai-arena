@@ -37,6 +37,7 @@ AI_ARENA_DB="auto"
 AI_ARENA_LOCAL_FILES=""
 AI_ARENA_MAIN_ENV=""
 AI_ARENA_REVIEWERS="claude:opus,opencode"
+AI_ARENA_AGENTS_REPO="https://github.com/trebormc/drupal-ai-agents.git"
 
 log()  { printf '==> %s\n' "$*" >&2; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -56,7 +57,10 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   doctor                                   Check host tools, layout, coordinator containers
   up                                       Start the coordinator project's containers
   init "<task>" [--candidates a,b] [--pm harness[:model]] [--description "..."]
-                                           Create arena/<slug>/manifest.json
+                                           Create arena/<slug>/manifest.json. A candidate is
+                                           harness[:model][@agents] where @agents pins the agents
+                                           repo (a branch of the default repo, or url#ref) to
+                                           evaluate a change to the agents pack
   plan <slug> ["description"]              PM session writes arena/<slug>/brief.md
   spawn <slug> [label...]                  Create candidate environments (worktree-add --tmp)
   run <slug> [label...]                    Start candidates (detached) on the brief
@@ -225,6 +229,11 @@ create_candidate_env() { # label
   [ -n "$AI_ARENA_LOCAL_FILES" ] && args+=(--local-files "$AI_ARENA_LOCAL_FILES")
   local ae; ae="$(agents_env_for "$(cand_get "$l" '.harness')" "$(cand_get "$l" '.model // empty')")"
   [ -n "$ae" ] && args+=(--agents-env "$ae")
+  local ag; ag="$(cand_get "$l" '.agents // empty')"
+  if [ -n "$ag" ]; then
+    case "$ag" in *://*|*@*:*) ag="${ag//;/,}" ;; *) ag="${AI_ARENA_AGENTS_REPO}#${ag}" ;; esac
+    args+=(--agents-sync-env "AGENTS_REPOS=$ag")
+  fi
   "$SCRIPT_DIR/worktree-add" "${args[@]}" "$(cand_get "$l" '.branch')" > /dev/null
 }
 
@@ -271,19 +280,30 @@ settle_candidate() { # label -> prints new state
   if [ -f "$report" ]; then status="$( { grep -E '^STATUS:' "$report" || true; } | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"; fi
   case "$status" in DONE|BLOCKED|FAILED|PARTIAL) ;; *) status="FAILED" ;; esac
   cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"; cand_set "$label" finished "$(now)"
+  # Cost and duration when the harness reports them (Claude Code JSON); duration falls back to the timestamps.
+  local cost dur started
+  cost="$( { jq -r 'if type=="array" then (.[] | select(.total_cost_usd?) | .total_cost_usd) else (.total_cost_usd // empty) end' "$env_dir/arena-run.json" 2>/dev/null || true; } | head -n1 || true)"
+  dur="$( { jq -r 'if type=="array" then (.[] | select(.duration_ms?) | .duration_ms) else (.duration_ms // empty) end' "$env_dir/arena-run.json" 2>/dev/null || true; } | head -n1 || true)"
+  if [ -n "$dur" ]; then dur=$(( ${dur%.*} / 1000 )); else
+    started="$(cand_get "$label" '.started // empty')"
+    if [ -n "$started" ]; then dur=$(( $(date -u +%s) - $(date -u -d "$started" +%s) )); else dur=""; fi
+  fi
+  [ -n "$cost" ] && cand_set_json "$label" cost_usd "$cost"
+  [ -n "$dur" ] && cand_set_json "$label" duration_s "$dur"
   echo "$status"
 }
 
 status_json() {
   jq '{slug, status, description, coordinator, project, main_env, pm:{harness:.pm.harness, model:.pm.model, session:(.pm.session != null)},
-       candidates:[.candidates[] | {label, harness, model, branch, env_name, env_dir, state, exit_code, session:(.session != null), gates}], judge, winner}' "$MANIFEST"
+       candidates:[.candidates[] | {label, harness, model, agents, branch, env_name, env_dir, state, exit_code, session:(.session != null), gates, cost_usd, duration_s}], judge, winner}' "$MANIFEST"
 }
 
 status_table() {
-  printf '%-6s %-9s %-28s %-9s %-8s %s\n' LABEL HARNESS MODEL STATE GATES BRANCH
-  jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), .state,
+  printf '%-6s %-9s %-24s %-14s %-9s %-6s %-8s %-7s %s\n' LABEL HARNESS MODEL AGENTS STATE GATES COST TIME BRANCH
+  jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), (.agents // "-"), .state,
           (if .gates then ([.gates | to_entries[] | select(.key != "logs" and .key != "targets") | .value] | map(select(. == "fail")) | length | if . == 0 then "pass" else "fail" end) else "-" end),
-          .branch] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m s g b; do printf '%-6s %-9s %-28s %-9s %-8s %s\n' "$l" "$h" "$m" "$s" "$g" "$b"; done
+          (if .cost_usd then ("$" + (.cost_usd | tostring | .[0:6])) else "-" end), (if .duration_s then ((.duration_s | tostring) + "s") else "-" end),
+          .branch] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a s g c t b; do printf '%-6s %-9s %-24s %-14s %-9s %-6s %-8s %-7s %s\n' "$l" "$h" "$m" "$a" "$s" "$g" "$c" "$t" "$b"; done
 }
 
 # ---------------------------------------------------------------------------
@@ -304,6 +324,13 @@ gate_candidate() { # label
   gdir="$ARENA_DIR/candidates/$label/gates"; mkdir -p "$gdir"
   log "gates for $label"
   site="fail"; (cd "$env_dir" && ddev drush status --field=bootstrap) 2>"$gdir/site.log" | grep -q Successful && site="pass"
+  # Config gate: unexported config changes fail unless the brief allows them.
+  local config="skip" pending
+  pending="$( (cd "$env_dir" && ddev drush config:status --format=json 2>"$gdir/config.log") | jq -r 'if type=="array" then length elif type=="object" then (keys | length) else 0 end' 2>/dev/null || echo "?")"
+  if [ "$pending" = "0" ]; then config="pass"
+  elif [ "$pending" = "?" ] || [ -z "$pending" ]; then config="skip"
+  elif grep -qiE '^[-* ]*config changes:[[:space:]]*allowed' "$ARENA_DIR/brief.md" 2>/dev/null; then config="pass"; printf 'pending config changes: %s (allowed by the brief)\n' "$pending" >> "$gdir/config.log"
+  else config="fail"; printf 'pending config changes: %s (not allowed by the brief; export with drush cex or revert)\n' "$pending" >> "$gdir/config.log"; fi
   changed_files "$wt_repo" > "$gdir/changed-files.txt"
   targets="$(sed -nE 's#^(.*/)?((modules|themes|profiles)/custom/[^/]+)/.*#\2#p' "$gdir/changed-files.txt" | sort -u)"
   docroot="$(sed -nE 's#^(.*/)?(modules|themes|profiles)/custom/[^/]+/.*#\1#p' "$gdir/changed-files.txt" | sort -u | head -n1)"
@@ -331,8 +358,8 @@ gate_candidate() { # label
       [ "$any" = "1" ] || phpunit="skip"
     fi
   fi
-  jq -n --arg site "$site" --arg phpstan "$phpstan" --arg phpcs "$phpcs" --arg phpunit "$phpunit" --arg logs "$gdir" --arg targets "$targets" \
-    '{site:$site, phpstan:$phpstan, phpcs:$phpcs, phpunit:$phpunit, targets:($targets | split("\n") | map(select(. != ""))), logs:$logs}' > "$gdir/../gates.json"
+  jq -n --arg site "$site" --arg config "$config" --arg phpstan "$phpstan" --arg phpcs "$phpcs" --arg phpunit "$phpunit" --arg logs "$gdir" --arg targets "$targets" \
+    '{site:$site, config:$config, phpstan:$phpstan, phpcs:$phpcs, phpunit:$phpunit, targets:($targets | split("\n") | map(select(. != ""))), logs:$logs}' > "$gdir/../gates.json"
   cand_set_json "$label" gates "$(jq 'del(.logs)' "$gdir/../gates.json")"
   jq -c . "$gdir/../gates.json"
 }
@@ -394,10 +421,11 @@ cmd_init() {
   [ ${#specs[@]} -le "$AI_ARENA_MAX_CANDIDATES" ] || die "too many candidates (${#specs[@]} > AI_ARENA_MAX_CANDIDATES=$AI_ARENA_MAX_CANDIDATES)"
   for spec in ${specs[@]+"${specs[@]}"}; do
     spec="$(printf '%s' "$spec" | tr -d '[:space:]')"; [ -n "$spec" ] || continue
+    local agents=""; case "$spec" in *@*) agents="${spec#*@}"; spec="${spec%%@*}" ;; esac
     harness="${spec%%:*}"; model=""; [ "$spec" != "$harness" ] && model="${spec#*:}"; harness_user "$harness" >/dev/null
     label="$(printf "\\$(printf '%03o' $((97 + i)))")"
-    cands="$(jq --arg l "$label" --arg h "$harness" --arg m "$model" --arg b "tmp/$slug-$label" --arg n "${BASE}-tmp-${slug}-${label}" --arg d "$TMP_DIR/${BASE}-tmp-${slug}-${label}" \
-      '. + [{label:$l, harness:$h, model:(if $m=="" then null else $m end), branch:$b, env_name:$n, env_dir:$d, state:"init", session:null, gates:null}]' <<< "$cands")"
+    cands="$(jq --arg l "$label" --arg h "$harness" --arg m "$model" --arg a "$agents" --arg b "tmp/$slug-$label" --arg n "${BASE}-tmp-${slug}-${label}" --arg d "$TMP_DIR/${BASE}-tmp-${slug}-${label}" \
+      '. + [{label:$l, harness:$h, model:(if $m=="" then null else $m end), agents:(if $a=="" then null else $a end), branch:$b, env_name:$n, env_dir:$d, state:"init", session:null, gates:null, cost_usd:null, duration_s:null}]' <<< "$cands")"
     i=$((i + 1))
   done
   [ "$i" -gt 0 ] || die "no candidates"
@@ -519,12 +547,13 @@ cmd_reveal() {
   case "$winner" in ""|none|NONE|None) winner="" ;; esac
   if [ -n "$winner" ] && ! jq -e --arg l "$winner" '.candidates[] | select(.label==$l)' "$MANIFEST" >/dev/null; then warn "judge named '$winner', which is not a label"; winner=""; fi
   echo "arena: $SLUG   winner: ${winner:-(none yet)}"
-  printf '%-6s %-9s %s\n' LABEL HARNESS MODEL
-  jq -r '.candidates[] | [.label, .harness, (.model // "(default)")] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m; do printf '%-6s %-9s %s\n' "$l" "$h" "$m"; done
+  printf '%-6s %-9s %-24s %-24s %-8s %s\n' LABEL HARNESS MODEL AGENTS COST TIME
+  jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), (.agents // "-"), (.cost_usd // "-" | tostring), (.duration_s // "-" | tostring)] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a c t; do printf '%-6s %-9s %-24s %-24s %-8s %s\n' "$l" "$h" "$m" "$a" "$c" "$t"; done
   if [ -n "$winner" ]; then
-    mkdir -p "$(dirname "$WINS_LOG")"; [ -f "$WINS_LOG" ] || printf 'ts\tproject\tslug\twinner\tharness\tmodel\tcandidates\n' > "$WINS_LOG"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$COORD" "$SLUG" "$winner" "$(cand_get "$winner" '.harness')" "$(cand_get "$winner" '.model // "(default)"')" \
-      "$(jq -r '[.candidates[] | .harness + ":" + (.model // "default")] | join(",")' "$MANIFEST")" >> "$WINS_LOG"
+    mkdir -p "$(dirname "$WINS_LOG")"; [ -f "$WINS_LOG" ] || printf 'ts\tproject\tslug\twinner\tharness\tmodel\tagents\tcost_usd\tduration_s\tcandidates\n' > "$WINS_LOG"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$COORD" "$SLUG" "$winner" "$(cand_get "$winner" '.harness')" "$(cand_get "$winner" '.model // "(default)"')" \
+      "$(cand_get "$winner" '.agents // "-"')" "$(cand_get "$winner" '.cost_usd // "-"')" "$(cand_get "$winner" '.duration_s // "-"')" \
+      "$(jq -r '[.candidates[] | .harness + ":" + (.model // "default") + (if .agents then "@" + .agents else "" end) + "=" + (.cost_usd // "-" | tostring) + "$/" + (.duration_s // "-" | tostring) + "s"] | join(",")' "$MANIFEST")" >> "$WINS_LOG"
     log "logged to $WINS_LOG"
   fi
 }
