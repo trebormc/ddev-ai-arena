@@ -135,10 +135,25 @@ inline so a run degrades gracefully if that skill is missing.
 `.ddev/.env.ai-arena` (created on install): candidate panel, PM harness/model, cap,
 timeout, base ref, DB source, extra local files, provisioning steps, spawn/remove hooks.
 
+## Part of DDEV AI Workspace
+
+This add-on is part of [DDEV AI Workspace](https://github.com/trebormc/ddev-ai-workspace), a modular ecosystem of DDEV add-ons for AI-powered Drupal development.
+
+| Repository | Description | Relationship |
+|------------|-------------|--------------|
+| [ddev-ai-workspace](https://github.com/trebormc/ddev-ai-workspace) | Meta add-on that installs the full AI development stack with one command. | Workspace |
+| [ddev-claude-code](https://github.com/trebormc/ddev-claude-code) | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI container for interactive development. | Runs candidates and the project manager |
+| [ddev-opencode](https://github.com/trebormc/ddev-opencode) | [OpenCode](https://opencode.ai) AI CLI container for interactive development. | Runs candidates and the project manager |
+| [ddev-ralph](https://github.com/trebormc/ddev-ralph) | Autonomous AI task orchestrator: one task after another through an AI container. | Sibling: sequential loop instead of parallel candidates |
+| [ddev-agents-sync](https://github.com/trebormc/ddev-agents-sync) | Syncs agent repos and resolves model tokens per project. | Per-candidate model overrides go through its `.env.agents` cascade |
+| [ddev-beads](https://github.com/trebormc/ddev-beads) | [Beads](https://github.com/steveyegge/beads) git-backed task tracker. | Candidates skip it; the main project keeps the task |
+| [ddev-playwright-mcp](https://github.com/trebormc/ddev-playwright-mcp) | Headless Playwright browser. | Candidates verify on their own browser |
+| [ddev-ai-ssh](https://github.com/trebormc/ddev-ai-ssh) | SSH access to the web container. | Each candidate environment gets its own keys |
+| [drupal-ai-agents](https://github.com/trebormc/drupal-ai-agents) | 11 agents, 17 rules, 38 skills for Drupal development. | Provides the `arena-protocol` skill |
+
 ## Disclaimer
 
-This project is an independent initiative by [Robert Menetray](https://menetray.com).
-AI-generated code may contain errors. Always review the winning branch before merging.
+This project is an independent initiative by [Robert Menetray](https://menetray.com), sponsored by [DruScan](https://druscan.com). It is not affiliated with Anthropic, OpenCode, Beads, Playwright, Microsoft, or DDEV. AI-generated code may contain errors. Always review the winning branch before merging.
 
 ## License
 
