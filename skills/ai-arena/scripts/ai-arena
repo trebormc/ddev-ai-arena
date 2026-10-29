@@ -155,7 +155,9 @@ harness_cmd() { # harness model session prompt_file_in_container
       [ -n "$model" ] && cmd="$cmd --model $(printf '%q' "$model")"
       [ -n "$session" ] && cmd="$cmd --resume $(printf '%q' "$session")" ;;
     opencode)
-      cmd="opencode run --format json"
+      # OpenCode 2: --standalone (private server per run) + --auto (approve
+      # permissions not denied by the config; detached runs cannot answer prompts)
+      cmd="opencode run --standalone --format json --auto"
       [ -n "$model" ] && cmd="$cmd -m $(printf '%q' "$model")"
       [ -n "$session" ] && cmd="$cmd -s $(printf '%q' "$session")" ;;
   esac
