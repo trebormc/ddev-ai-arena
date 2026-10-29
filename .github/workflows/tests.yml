@@ -1,0 +1,38 @@
+name: tests
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - "**.md"
+
+  schedule:
+    - cron: '25 08 * * 3'
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # ai-arena is a host package, not a DDEV add-on: the suite runs on the host
+    # without DDEV or Docker, so plain bats is enough.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats and its libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats bats-assert bats-file bats-support jq
+
+      - name: Run tests
+        run: bats tests

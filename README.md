@@ -1,3 +1,4 @@
+[![tests](https://github.com/trebormc/ddev-ai-arena/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/trebormc/ddev-ai-arena/actions/workflows/tests.yml?query=branch%3Amain)
 [![last commit](https://img.shields.io/github/last-commit/trebormc/ddev-ai-arena)](https://github.com/trebormc/ddev-ai-arena/commits)
 [![release](https://img.shields.io/github/v/release/trebormc/ddev-ai-arena)](https://github.com/trebormc/ddev-ai-arena/releases/latest)
 
