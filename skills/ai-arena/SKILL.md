@@ -57,6 +57,13 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
    candidate with `@<branch>` (same model, same task: `claude:sonnet@main,claude:sonnet@feature/x`). Default panel and cap (max 3) come from `ai-arena.env`. Different
    harnesses and models per label are the point: keep the panel diverse unless the
    user names one.
+   **Approaches mode** (the user wants to compare designs, not models: "misma tarea
+   con dos enfoques", "compare approach X vs Y"): same model for every label, usually
+   `--candidates opencode,opencode`, plus either `--approach "<text>"` once per label in
+   order (the user dictates them) or `--approaches` (the PM proposes one per label in
+   `plan` and replies `ASK_USER` with the list: put it to the user, send changes with
+   `ai-arena pm <slug> "..."`, spawn only once the user confirms). Approaches live in
+   `arena/<slug>/approach-<label>.md`; `status`, `reveal` and the judge show them.
 3. **Plan.** `ai-arena plan <slug>`. The PM session (coordinator container) runs
    `code-review` in PLAN mode over `main/<repo>` and writes `arena/<slug>/brief.md`.
    Read the brief. On `VERDICT: ASK_USER`, put the question to the user, then

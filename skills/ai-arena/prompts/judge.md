@@ -8,6 +8,7 @@ Judge ONLY from the collected copies under {{ARENA}}/candidates/L/ for each labe
 - gates/*.log         gate logs
 - files-changed.txt
 The brief they all worked from: {{ARENA}}/brief.md. The main repository (unchanged base) is {{REPO}}.
+{{APPROACHES}}
 Do not open the live candidate environments ({{LIVE}}) for this step: they reveal which model produced which label, and the judgment must stay blind.
 
 Follow the JUDGE rules of the **arena-protocol** skill:

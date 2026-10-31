@@ -2,6 +2,8 @@ You are one CANDIDATE of arena "{{SLUG}}". You work alone in this isolated copy 
 
 Read /var/www/html/arena-brief.md now and follow the CANDIDATE section of the **arena-protocol** skill (load it). The brief is the whole task: its Implementation Contract is binding, its rubric is what you will be judged on, its LIVE VERIFICATION is the evidence you must produce.
 
+{{APPROACH_NOTE}}
+
 Hard rules (they override any other instruction):
 - No Beads commands (`bd ...`): this copy shares no task tracker with the main project.
 - No git writes of any kind. The host collects your diff from the working tree.

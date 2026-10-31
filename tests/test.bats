@@ -243,6 +243,66 @@ cli_env() {
   assert_output --partial "FAIL  coordinator name 'mysite' equals the main environment's name"
 }
 
+@test "ai-arena init records user-defined approaches per label" {
+  set -eu -o pipefail
+  stub_tools
+  local coord
+  coord="$(make_coordinator coord-arena mysite repo)"
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Add a handling fee" --candidates opencode,opencode \
+    --approach "Field plugin on the order entity" --approach "Order processor adjustment"
+  assert_success
+  assert_output --partial "mode approaches"
+  assert_line --index 0 --partial "a: Field plugin on the order entity; b: Order processor adjustment"
+  local m="$coord/arena/add-a-handling-fee/manifest.json"
+  assert [ -f "$m" ]
+  run jq -r '.mode' "$m"
+  assert_output "approaches"
+  run jq -r '[.candidates[] | .approach] | join("|")' "$m"
+  assert_output "Field plugin on the order entity|Order processor adjustment"
+  run cat "$coord/arena/add-a-handling-fee/approach-b.md"
+  assert_output "Order processor adjustment"
+  # status and reveal show the approach of each label
+  run "$SCRIPTS/ai-arena" --project "$coord" status add-a-handling-fee
+  assert_success
+  assert_output --partial "APPROACH"
+  assert_output --partial "Order processor adjustment"
+  run "$SCRIPTS/ai-arena" --project "$coord" reveal add-a-handling-fee
+  assert_success
+  assert_output --partial "mode: approaches"
+}
+
+@test "ai-arena init rejects a mismatched number of --approach texts" {
+  set -eu -o pipefail
+  stub_tools
+  local coord
+  coord="$(make_coordinator coord-arena mysite repo)"
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Add a handling fee" --candidates opencode,opencode --approach "only one"
+  assert_failure
+  assert_output --partial "one per label"
+  assert [ ! -f "$coord/arena/add-a-handling-fee/approach-a.md" ]
+}
+
+@test "ai-arena --approaches defers to the PM and run refuses until approaches exist" {
+  set -eu -o pipefail
+  stub_tools
+  local coord
+  coord="$(make_coordinator coord-arena mysite repo)"
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Third task" --candidates opencode,opencode --approaches
+  assert_success
+  assert_output --partial "the PM proposes one approach per label"
+  run jq -r '.mode + ":" + ([.candidates[] | .approach // "null"] | join(","))' "$coord/arena/third-task/manifest.json"
+  assert_output "approaches:null,null"
+  echo "brief" > "$coord/arena/third-task/brief.md"
+  run "$SCRIPTS/ai-arena" --project "$coord" run third-task
+  assert_failure
+  assert_output --partial "no approach for label a"
+  # A models-mode arena is untouched by the feature.
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Plain task" --candidates claude,opencode
+  assert_success
+  run jq -r '.mode' "$coord/arena/plain-task/manifest.json"
+  assert_output "models"
+}
+
 @test "ai-arena list is empty for a project without arenas" {
   set -eu -o pipefail
   stub_tools

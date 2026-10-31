@@ -158,6 +158,27 @@ ai-arena clean add-a-handling-fee
 | `list` | Arenas in this project |
 | `review (--branch <b> \| --env <dir> \| --patch <file>) [--reviewers a,b] [--intent "..."]` | Multi-model review of one diff: independent reviewers on different harnesses/models in the coordinator's containers, then a lead synthesis (act on / consider / noted / dismissed); no worktrees needed |
 
+### Comparing approaches instead of models
+
+Sometimes the open question is not which model but which design: field plugin or
+preprocess hook, queue or synchronous, custom module or configuration. Approaches mode
+runs the same task with the same model and one prescribed approach per label:
+
+```bash
+# you dictate the approaches (one --approach per label, in order a, b, ...)
+ai-arena init "Add a handling fee" --candidates opencode,opencode \
+  --approach "Field plugin on the order entity; fee computed in a presave hook" \
+  --approach "Order processor plugin (commerce_order) adding an adjustment; no new fields"
+# or let the PM propose them during plan and confirm before spawning
+ai-arena init "Add a handling fee" --candidates opencode,opencode --approaches
+```
+
+The contract, rubric and live verification stay common and approach-neutral; each
+candidate also receives `arena-approach.md` and must follow it (or report BLOCKED). The
+judge compares the approaches as implemented and names the one to adopt; `reveal` and
+the wins log record the approach of each label. One candidate per approach is one sample:
+for a weighty decision, run two labels per approach.
+
 ### Evaluating a change to the agents pack
 
 A candidate is `harness[:model][@agents]`. The `@agents` part pins the agents repository

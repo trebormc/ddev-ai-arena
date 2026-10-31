@@ -17,7 +17,7 @@
 set -euo pipefail
 shopt -u patsub_replacement 2>/dev/null || true
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PROMPTS_DIR="$SCRIPT_DIR/../prompts"
 CONTAINER_ROOT="/var/www/html"
@@ -57,10 +57,16 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   doctor                                   Check host tools, layout, coordinator containers
   up                                       Start the coordinator project's containers
   init "<task>" [--candidates a,b] [--pm harness[:model]] [--description "..."]
+       [--approaches | --approach "..." ...]
                                            Create arena/<slug>/manifest.json. A candidate is
                                            harness[:model][@agents] where @agents pins the agents
                                            repo (a branch of the default repo, or url#ref) to
-                                           evaluate a change to the agents pack
+                                           evaluate a change to the agents pack.
+                                           APPROACHES MODE: same task, one prescribed approach
+                                           per label (usually the same model for all, e.g.
+                                           --candidates opencode,opencode). --approach "text"
+                                           (one per label, in order) dictates them; --approaches
+                                           lets the PM propose them in `plan` for your confirmation
   plan <slug> ["description"]              PM session writes arena/<slug>/brief.md
   spawn <slug> [label...]                  Create candidate environments (worktree-add --tmp)
   run <slug> [label...]                    Start candidates (detached) on the brief
@@ -115,6 +121,27 @@ mf_require() {
   MANIFEST="$ARENA_DIR/manifest.json"
   [ -f "$MANIFEST" ] || die "no arena '$SLUG' (expected $MANIFEST). Run: ai-arena init"
   CONTAINER_ARENA="$CONTAINER_ROOT/arena/$SLUG"
+}
+
+# Approaches mode: arena/<slug>/approach-<label>.md holds the approach assigned to a
+# label (first line = title). The manifest carries .mode and .candidates[].approach (title).
+arena_mode() { mf_get '.mode // "models"'; }
+approach_file() { printf '%s/approach-%s.md' "$ARENA_DIR" "$1"; }
+approach_title() { # file -> first non-empty line, without heading marks, <= 70 chars
+  [ -s "$1" ] || return 0
+  grep -m1 -vE '^[[:space:]]*$' "$1" | sed -E 's/^#+[[:space:]]*//' | cut -c1-70
+}
+sync_approaches() { # copy each approach title into the manifest
+  local l t
+  for l in $(labels); do
+    t="$(approach_title "$(approach_file "$l")")"
+    [ -n "$t" ] && cand_set "$l" approach "$t"
+  done
+}
+approaches_summary() { # "a: title; b: title"
+  local l t out=""
+  for l in $(labels); do t="$(approach_title "$(approach_file "$l")")"; out+="${out:+; }$l: ${t:-?}"; done
+  printf '%s' "$out"
 }
 mf_get() { jq -r "$1" "$MANIFEST"; }
 mf_update() {
@@ -296,16 +323,16 @@ settle_candidate() { # label -> prints new state
 }
 
 status_json() {
-  jq '{slug, status, description, coordinator, project, main_env, pm:{harness:.pm.harness, model:.pm.model, session:(.pm.session != null)},
-       candidates:[.candidates[] | {label, harness, model, agents, branch, env_name, env_dir, state, exit_code, session:(.session != null), gates, cost_usd, duration_s}], judge, winner}' "$MANIFEST"
+  jq '{slug, status, description, mode:(.mode // "models"), coordinator, project, main_env, pm:{harness:.pm.harness, model:.pm.model, session:(.pm.session != null)},
+       candidates:[.candidates[] | {label, harness, model, agents, approach, branch, env_name, env_dir, state, exit_code, session:(.session != null), gates, cost_usd, duration_s}], judge, winner}' "$MANIFEST"
 }
 
 status_table() {
-  printf '%-6s %-9s %-24s %-14s %-9s %-6s %-8s %-7s %s\n' LABEL HARNESS MODEL AGENTS STATE GATES COST TIME BRANCH
+  printf '%-6s %-9s %-24s %-14s %-9s %-6s %-8s %-7s %-32s %s\n' LABEL HARNESS MODEL AGENTS STATE GATES COST TIME BRANCH APPROACH
   jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), (.agents // "-"), .state,
           (if .gates then ([.gates | to_entries[] | select(.key != "logs" and .key != "targets") | .value] | map(select(. == "fail")) | length | if . == 0 then "pass" else "fail" end) else "-" end),
           (if .cost_usd then ("$" + (.cost_usd | tostring | .[0:6])) else "-" end), (if .duration_s then ((.duration_s | tostring) + "s") else "-" end),
-          .branch] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a s g c t b; do printf '%-6s %-9s %-24s %-14s %-9s %-6s %-8s %-7s %s\n' "$l" "$h" "$m" "$a" "$s" "$g" "$c" "$t" "$b"; done
+          .branch, (.approach // "-")] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a s g c t b ap; do printf '%-6s %-9s %-24s %-14s %-9s %-6s %-8s %-7s %-32s %s\n' "$l" "$h" "$m" "$a" "$s" "$g" "$c" "$t" "$b" "$ap"; done
 }
 
 # ---------------------------------------------------------------------------
@@ -406,13 +433,16 @@ cmd_up() { log "ddev start ($COORD)"; (cd "$PROJECT" && ddev start -y); }
 
 cmd_init() {
   local task="" candidates="$AI_ARENA_DEFAULT_CANDIDATES" pm="${AI_ARENA_PM_HARNESS}${AI_ARENA_PM_MODEL:+:$AI_ARENA_PM_MODEL}" description="" force=0
+  local mode="models" approach_texts=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --candidates) candidates="$2"; shift 2 ;; --pm) pm="$2"; shift 2 ;; --description) description="$2"; shift 2 ;; --force) force=1; shift ;;
+      --approaches) mode="approaches"; shift ;;
+      --approach) [ -n "${2:-}" ] || die "--approach needs a text"; approach_texts+=("$2"); mode="approaches"; shift 2 ;;
       -*) die "unknown option $1" ;; *) [ -z "$task" ] && task="$1" || description="$description $1"; shift ;;
     esac
   done
-  [ -n "$task" ] || die "usage: init \"<task>\" [--candidates a,b] [--pm harness[:model]] [--description \"...\"]"
+  [ -n "$task" ] || die "usage: init \"<task>\" [--candidates a,b] [--pm harness[:model]] [--description \"...\"] [--approaches | --approach \"...\" ...]"
   [ -n "$description" ] || description="$task"
   local slug dir; slug="$(slugify "$task")"; [ -n "$slug" ] || die "cannot derive a slug from '$task'"; dir="$(arena_dir "$slug")"
   [ -f "$dir/manifest.json" ] && [ "$force" = "0" ] && die "arena '$slug' exists (use --force to recreate the manifest)"
@@ -431,20 +461,50 @@ cmd_init() {
     i=$((i + 1))
   done
   [ "$i" -gt 0 ] || die "no candidates"
+  if [ ${#approach_texts[@]} -gt 0 ]; then
+    [ ${#approach_texts[@]} -eq "$i" ] || die "--approach given ${#approach_texts[@]} time(s) for $i candidate(s): one per label, in order (a, b, ...)"
+  fi
+  rm -f "$dir"/approach-*.md
   jq -n --arg slug "$slug" --arg task "$task" --arg description "$description" --arg created "$(now)" --arg ph "$pm_harness" --arg pm "$pm_model" \
-    --arg coord "$COORD" --arg project "$PROJECT" --arg main "$MAIN_ENV" --arg repo "$REPO_REL" --argjson c "$cands" \
-    '{slug:$slug, task:$task, description:$description, status:"init", created:$created, coordinator:$coord, project:$project, main_env:$main, repo_rel:$repo,
-      pm:{harness:$ph, model:(if $pm=="" then null else $pm end), session:null}, candidates:$c, judge:null, winner:null}' > "$dir/manifest.json"
-  log "arena '$slug' created with $i candidate(s): $dir"
+    --arg coord "$COORD" --arg project "$PROJECT" --arg main "$MAIN_ENV" --arg repo "$REPO_REL" --arg mode "$mode" --argjson c "$cands" \
+    '{slug:$slug, task:$task, description:$description, status:"init", mode:$mode, created:$created, coordinator:$coord, project:$project, main_env:$main, repo_rel:$repo,
+      pm:{harness:$ph, model:(if $pm=="" then null else $pm end), session:null}, candidates:($c | map(. + {approach:null})), judge:null, winner:null}' > "$dir/manifest.json"
+  if [ ${#approach_texts[@]} -gt 0 ]; then
+    local k=0 t
+    for t in "${approach_texts[@]}"; do
+      label="$(printf "\\$(printf '%03o' $((97 + k)))")"
+      printf '%s\n' "$t" > "$dir/approach-$label.md"
+      k=$((k + 1))
+    done
+    ARENA_DIR="$dir"; MANIFEST="$dir/manifest.json"; sync_approaches
+    log "approaches assigned: $(approaches_summary)"
+  elif [ "$mode" = approaches ]; then
+    log "approaches mode: the PM proposes one approach per label in 'plan' (confirm them before spawn)"
+  fi
+  log "arena '$slug' created with $i candidate(s), mode $mode: $dir"
   echo "$slug"
 }
 
 cmd_plan() {
   mf_require "${1:-}"; shift || true
-  local description="${1:-$(mf_get '.description')}" msg
+  local description="${1:-$(mf_get '.description')}" msg block="" l
   msg="$(fill_prompt plan.md)"; msg="${msg//\{\{TASK\}\}/$description}"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
+  if [ "$(arena_mode)" = approaches ]; then
+    if ls "$ARENA_DIR"/approach-*.md >/dev/null 2>&1; then
+      block="APPROACHES MODE, user-defined. Every candidate works from the same Implementation Contract, but each label has an ASSIGNED approach the user already wrote:"$'\n'
+      for l in $(labels); do block+="- $l: $(approach_title "$(approach_file "$l")") (full text: $CONTAINER_ARENA/approach-$l.md)"$'\n'; done
+      block+="Read them. Keep the Implementation Contract approach-neutral: everything that differs between approaches lives in those files, not in the contract (the rubric and the live verification must be satisfiable by every approach). Do not rewrite the approach files; if one cannot work in this codebase, reply with VERDICT: ASK_USER and say why."
+    else
+      block="APPROACHES MODE, PM-proposed. The candidates ($(labels | tr '\n' ' ')) run the same model; the variable under test is the approach. From the codebase, propose one genuinely different and defensible approach per label (different placement, mechanism or trade-off, not cosmetic variants) and write each to $CONTAINER_ARENA/approach-<label>.md: first line a short title, then what to build differently, where, and what to avoid. Keep the Implementation Contract approach-neutral (rubric and live verification satisfiable by every approach). Then reply with VERDICT: ASK_USER listing the approaches, one line per label, so the user confirms or changes them before anything is spawned."
+    fi
+  fi
+  msg="${msg//\{\{APPROACHES\}\}/$block}"
   pm_call "$msg"
   [ -s "$ARENA_DIR/brief.md" ] || die "the PM did not write $ARENA_DIR/brief.md (see arena/$SLUG/pm/*.log)"
+  if [ "$(arena_mode)" = approaches ]; then
+    for l in $(labels); do [ -s "$(approach_file "$l")" ] || warn "no approach for label $l yet ($(approach_file "$l")); settle it with 'ai-arena pm' before run"; done
+    sync_approaches
+  fi
   mf_update '.status = "planned"'; log "brief written: $ARENA_DIR/brief.md"
 }
 
@@ -464,11 +524,24 @@ cmd_run() {
   mf_require "${1:-}"; shift || true
   [ -s "$ARENA_DIR/brief.md" ] || die "no brief (ai-arena plan $SLUG)"
   # Inside a candidate's own container the repo sits at /var/www/html/<repo>, not at the coordinator path.
-  local l prompt env_dir; prompt="$(sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/candidate.md")"
+  local l prompt env_dir note p; prompt="$(sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/candidate.md")"
+  if [ "$(arena_mode)" = approaches ]; then
+    for l in $(resolve_labels "$@"); do [ -s "$(approach_file "$l")" ] || die "approaches mode but no approach for label $l ($(approach_file "$l")): run 'ai-arena plan' / 'ai-arena pm' first"; done
+    sync_approaches
+  fi
   for l in $(resolve_labels "$@"); do
     guard_label "$l"
     case "$(cand_get "$l" '.state')" in ready|DONE|BLOCKED|FAILED|PARTIAL) ;; running) warn "$l already running"; continue ;; *) warn "$l not ready"; continue ;; esac
-    env_dir="$(cand_get "$l" '.env_dir')"; cp "$ARENA_DIR/brief.md" "$env_dir/arena-brief.md"; launch_candidate "$l" "$prompt" 0
+    env_dir="$(cand_get "$l" '.env_dir')"; cp "$ARENA_DIR/brief.md" "$env_dir/arena-brief.md"
+    note=""
+    if [ -s "$(approach_file "$l")" ]; then
+      cp "$(approach_file "$l")" "$env_dir/arena-approach.md"
+      note="Your ASSIGNED APPROACH is in /var/www/html/arena-approach.md. It is binding like the contract: follow it even where you would choose differently, and name it in SUMMARY. If it cannot work in this codebase, report STATUS: BLOCKED explaining why instead of switching approach silently."
+    else
+      rm -f "$env_dir/arena-approach.md"
+    fi
+    p="${prompt//\{\{APPROACH_NOTE\}\}/$note}"
+    launch_candidate "$l" "$p" 0
   done
   mf_update '.status = "running"'
 }
@@ -515,7 +588,11 @@ cmd_collect() { mf_require "${1:-}"; shift || true; local l; for l in $(labels);
 cmd_judge() {
   mf_require "${1:-}"; shift || true
   ls "$ARENA_DIR"/candidates/*/report.md >/dev/null 2>&1 || die "nothing collected (ai-arena collect $SLUG)"
-  local msg out; msg="$(fill_prompt judge.md)"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
+  local msg out block=""; msg="$(fill_prompt judge.md)"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
+  if [ "$(arena_mode)" = approaches ]; then
+    block="APPROACHES MODE: each label was ASSIGNED its approach ($(approaches_summary); full texts in $CONTAINER_ARENA/approach-<label>.md). The candidates did not choose them, so judge the approaches as implemented: contract conformance, size and reader load of the change, test footprint, config churn, risk and maintainability. The winner is the approach to adopt. Do not penalise a label for following its assigned approach; do penalise one that abandoned it silently. Say explicitly which approach wins and why the other loses."
+  fi
+  msg="${msg//\{\{APPROACHES\}\}/$block}"
   out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.judge = $j | .status = "judged"'; printf '%s\n' "$out"
 }
 
@@ -548,14 +625,14 @@ cmd_reveal() {
   local winner; winner="$(mf_get '.winner.label // .judge.winner // empty')"
   case "$winner" in ""|none|NONE|None) winner="" ;; esac
   if [ -n "$winner" ] && ! jq -e --arg l "$winner" '.candidates[] | select(.label==$l)' "$MANIFEST" >/dev/null; then warn "judge named '$winner', which is not a label"; winner=""; fi
-  echo "arena: $SLUG   winner: ${winner:-(none yet)}"
-  printf '%-6s %-9s %-24s %-24s %-8s %s\n' LABEL HARNESS MODEL AGENTS COST TIME
-  jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), (.agents // "-"), (.cost_usd // "-" | tostring), (.duration_s // "-" | tostring)] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a c t; do printf '%-6s %-9s %-24s %-24s %-8s %s\n' "$l" "$h" "$m" "$a" "$c" "$t"; done
+  echo "arena: $SLUG   mode: $(arena_mode)   winner: ${winner:-(none yet)}"
+  printf '%-6s %-9s %-24s %-24s %-8s %-7s %s\n' LABEL HARNESS MODEL AGENTS COST TIME APPROACH
+  jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), (.agents // "-"), (.cost_usd // "-" | tostring), (.duration_s // "-" | tostring), (.approach // "-")] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a c t ap; do printf '%-6s %-9s %-24s %-24s %-8s %-7s %s\n' "$l" "$h" "$m" "$a" "$c" "$t" "$ap"; done
   if [ -n "$winner" ]; then
     mkdir -p "$(dirname "$WINS_LOG")"; [ -f "$WINS_LOG" ] || printf 'ts\tproject\tslug\twinner\tharness\tmodel\tagents\tcost_usd\tduration_s\tcandidates\n' > "$WINS_LOG"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$COORD" "$SLUG" "$winner" "$(cand_get "$winner" '.harness')" "$(cand_get "$winner" '.model // "(default)"')" \
       "$(cand_get "$winner" '.agents // "-"')" "$(cand_get "$winner" '.cost_usd // "-"')" "$(cand_get "$winner" '.duration_s // "-"')" \
-      "$(jq -r '[.candidates[] | .harness + ":" + (.model // "default") + (if .agents then "@" + .agents else "" end) + "=" + (.cost_usd // "-" | tostring) + "$/" + (.duration_s // "-" | tostring) + "s"] | join(",")' "$MANIFEST")" >> "$WINS_LOG"
+      "$(jq -r '[.candidates[] | .harness + ":" + (.model // "default") + (if .agents then "@" + .agents else "" end) + (if .approach then "#" + .approach else "" end) + "=" + (.cost_usd // "-" | tostring) + "$/" + (.duration_s // "-" | tostring) + "s"] | join(",")' "$MANIFEST")" >> "$WINS_LOG"
     log "logged to $WINS_LOG"
   fi
 }
