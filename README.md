@@ -125,7 +125,7 @@ fee to the order total, three candidates". Or by hand:
 
 ```bash
 ai-arena up
-ai-arena init "Add a handling fee" --candidates claude:opus,claude:sonnet,opencode
+ai-arena init "Add a handling fee" --candidates claude,opencode
 ai-arena plan add-a-handling-fee        # PM writes arena/<slug>/brief.md
 ai-arena spawn add-a-handling-fee       # worktree + DDEV + DB per candidate
 ai-arena run add-a-handling-fee         # detached
@@ -181,7 +181,7 @@ synthesize. No candidate environments, no database; reviewers read the diff and 
 code from the coordinator's mount.
 
 ```bash
-ai-arena review --branch feature/add-a-handling-fee --reviewers claude:opus,claude:sonnet,opencode
+ai-arena review --branch feature/add-a-handling-fee --reviewers claude,opencode
 ai-arena review --env worktree/atlas-feature-x --intent "cache the listing per role"
 ```
 

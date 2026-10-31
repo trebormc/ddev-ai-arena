@@ -27,7 +27,7 @@ GLOBAL_CONFIG="${HOME}/.ddev/ai-arena/config.env"
 # ---------------------------------------------------------------------------
 # Defaults, then ~/.ddev/ai-arena/config.env, then <project>/ai-arena.env
 # ---------------------------------------------------------------------------
-AI_ARENA_DEFAULT_CANDIDATES="claude:opus,claude:sonnet,opencode"
+AI_ARENA_DEFAULT_CANDIDATES="claude,opencode"
 AI_ARENA_PM_HARNESS="claude"
 AI_ARENA_PM_MODEL=""
 AI_ARENA_MAX_CANDIDATES=3

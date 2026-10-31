@@ -53,7 +53,7 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 # A <project>/ai-arena.env overrides these per project. Every line is optional.
 
 # Candidate panel: comma-separated "harness[:model]" (harness = claude | opencode).
-#AI_ARENA_DEFAULT_CANDIDATES=claude:opus,claude:sonnet,opencode
+#AI_ARENA_DEFAULT_CANDIDATES=claude,opencode
 
 # Project-manager session (runs in the coordinator's AI container).
 #AI_ARENA_PM_HARNESS=claude

@@ -52,7 +52,7 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
 
 1. **Bring up layer 2.** `ai-arena doctor`, then `ai-arena up` if the coordinator's
    containers are not running. Fix or report what doctor flags.
-2. **Init.** `ai-arena init "<task in the user's words>" [--candidates claude:opus,claude:sonnet,opencode] [--description "..."]`.
+2. **Init.** `ai-arena init "<task in the user's words>" [--candidates claude,opencode] [--description "..."]`.
    Prints the slug. To evaluate a change to the agents pack, pin the agents repo per
    candidate with `@<branch>` (same model, same task: `claude:sonnet@main,claude:sonnet@feature/x`). Default panel and cap (max 3) come from `ai-arena.env`. Different
    harnesses and models per label are the point: keep the panel diverse unless the
