@@ -37,7 +37,10 @@ You run on the host, inside a COORDINATOR project directory:
 └── worktree-tmp/     arena candidates, disposable, created and removed by the arena
 ```
 
-The scripts run on Linux only (GNU tools, bash 4.4+); `doctor` says so on other platforms. They live next to this file in `scripts/` (`ai-arena`, `worktree-add`,
+The coordinator must be created (`ddev config`) while no DDEV project is registered
+under its directory: DDEV refuses a new config above a registered project, but once the
+coordinator's `.ddev/config.yaml` exists the nested environments start normally (see the
+README). The scripts run on Linux only (GNU tools, bash 4.4+); `doctor` says so on other platforms. They live next to this file in `scripts/` (`ai-arena`, `worktree-add`,
 `worktree-remove`); `ai-arena` is also on the PATH after `install.sh`. The user talks
 only to you; layers 2 and 3 never talk to the user.
 

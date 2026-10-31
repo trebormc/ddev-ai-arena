@@ -87,15 +87,32 @@ git clone https://github.com/trebormc/ddev-ai-arena.git
 cd ddev-ai-arena && ./install.sh     # copies the skill to ~/.claude/skills and ~/.config/opencode/skills, links ai-arena, worktree-add and worktree-remove into ~/.local/bin
 ```
 
-Once per project, create the coordinator:
+Once per project, create the coordinator. Two DDEV rules shape the order:
+
+- `ddev config` refuses a new project in a directory that contains an already registered
+  project in a subdirectory, and checks this only while the config does not exist yet.
+- Since DDEV 1.25.4, `ddev start` in an unregistered project nested inside a registered
+  one asks whether to use the nested project, and `ddev start -y` silently uses the
+  outer one instead.
+
+So unlist the environments that live under the project directory, create the
+coordinator, unlist it again (`ddev config` registers it), register the environments
+back, and only then start the coordinator:
 
 ```bash
 cd projects/<project>
+ddev stop --unlist <base>                      # and any worktree/<env> project that is registered
 ddev config --project-type=generic --project-name=<base>-arena
+ddev stop --unlist <base>-arena                # keep the coordinator unregistered until main is back
+(cd main && ddev start)                        # re-registers the main environment at the same path
 ddev add-on get trebormc/ddev-ai-workspace     # AI containers, Playwright, agents pack; no Drupal needed
-ddev start
+ddev start                                     # registers the coordinator; its config already exists
 ai-arena doctor
 ```
+
+`worktree-add` registers every new environment with `ddev config --project-name` before
+starting it, so later environments under `worktree/` and `worktree-tmp/` never hit the
+nested-project prompt.
 
 The coordinator's name must differ from the main environment's DDEV name (the base for
 candidate names); `ai-arena doctor` fails when they collide. Move your main environment to `main/` (or leave it under

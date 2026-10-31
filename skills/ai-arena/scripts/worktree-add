@@ -184,9 +184,16 @@ if [ -n "$agents_sync_env" ]; then
   log "set agents-sync overrides in .ddev/.env.agents-sync"
 fi
 
+# Register the project before starting it. Since DDEV 1.25.4 an UNREGISTERED
+# project nested inside a registered one (here: the coordinator) is passed over by
+# `ddev start -y` in favour of the outer project. `ddev config` always acts on the
+# closest config.yaml, is non-interactive when given a flag, and registers the
+# project while pinning its name (the copied config has `name:` stripped).
+log "ddev config --project-name=$name"
+(cd "$dest" && ddev config --project-name="$name" >/dev/null)
+started=1   # registered: a failure from here on must `ddev delete` it
 log "ddev start ($name)"
 (cd "$dest" && ddev start -y)
-started=1
 # From here on the environment is usable: keep it on failure and let the user decide.
 trap - ERR EXIT
 
