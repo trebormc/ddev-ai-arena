@@ -32,6 +32,7 @@ AI_ARENA_PM_HARNESS="claude"
 AI_ARENA_PM_MODEL=""
 AI_ARENA_MAX_CANDIDATES=3
 AI_ARENA_TIMEOUT=7200
+AI_ARENA_WAIT_TIMEOUT=0
 AI_ARENA_BASE_REF=""
 AI_ARENA_DB="auto"
 AI_ARENA_LOCAL_FILES=""
@@ -71,11 +72,15 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   spawn <slug> [label...]                  Create candidate environments (worktree-add --tmp)
   run <slug> [label...]                    Start candidates (detached) on the brief
   wait <slug> [--all] [--timeout S] [--interval S]
-                                           Block until a candidate changes state (or all finish)
+                                           Block until a candidate changes state (or all finish);
+                                           no timeout by default (AI_ARENA_WAIT_TIMEOUT=0)
+  stop <slug> <label...>                   Kill a running candidate's harness and settle its state
+                                           from the report it has written so far
   status <slug> [--json]                   Show candidate states
   resume <slug> <label> "<message>"        Continue a candidate's session with a message
   pm <slug> "<message>"                    Send a message to the PM session, print its verdict
-  gate <slug> [label...]                   Mechanical gates (site, phpstan, phpcs, phpunit)
+  gate <slug> [label...]                   Mechanical gates (site, config, phpstan, phpcs, phpunit,
+                                           report: every FILES entry of the report exists in the tree)
   collect <slug>                           Gather diffs, reports and gates into arena/<slug>/candidates/
   judge <slug>                             PM judges the collected candidates (blind)
   promote <slug> <label> [--branch name] [--env]
@@ -309,14 +314,12 @@ settle_candidate() { # label -> prints new state
   if [ -f "$report" ]; then status="$( { grep -E '^STATUS:' "$report" || true; } | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"; fi
   case "$status" in DONE|BLOCKED|FAILED|PARTIAL) ;; *) status="FAILED" ;; esac
   cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"; cand_set "$label" finished "$(now)"
-  # Cost and duration when the harness reports them (Claude Code JSON); duration falls back to the timestamps.
+  # Cost when the harness reports it (Claude Code JSON). Duration is always wall clock from the
+  # manifest timestamps: the harness's own duration_ms covers one call, not the whole run.
   local cost dur started
   cost="$( { jq -r 'if type=="array" then (.[] | select(.total_cost_usd?) | .total_cost_usd) else (.total_cost_usd // empty) end' "$env_dir/arena-run.json" 2>/dev/null || true; } | head -n1 || true)"
-  dur="$( { jq -r 'if type=="array" then (.[] | select(.duration_ms?) | .duration_ms) else (.duration_ms // empty) end' "$env_dir/arena-run.json" 2>/dev/null || true; } | head -n1 || true)"
-  if [ -n "$dur" ]; then dur=$(( ${dur%.*} / 1000 )); else
-    started="$(cand_get "$label" '.started // empty')"
-    if [ -n "$started" ]; then dur=$(( $(date -u +%s) - $(date -u -d "$started" +%s) )); else dur=""; fi
-  fi
+  started="$(cand_get "$label" '.started // empty')"
+  if [ -n "$started" ]; then dur=$(( $(date -u +%s) - $(date -u -d "$started" +%s) )); else dur=""; fi
   [ -n "$cost" ] && cand_set_json "$label" cost_usd "$cost"
   [ -n "$dur" ] && cand_set_json "$label" duration_s "$dur"
   echo "$status"
@@ -387,8 +390,26 @@ gate_candidate() { # label
       [ "$any" = "1" ] || phpunit="skip"
     fi
   fi
-  jq -n --arg site "$site" --arg config "$config" --arg phpstan "$phpstan" --arg phpcs "$phpcs" --arg phpunit "$phpunit" --arg logs "$gdir" --arg targets "$targets" \
-    '{site:$site, config:$config, phpstan:$phpstan, phpcs:$phpcs, phpunit:$phpunit, targets:($targets | split("\n") | map(select(. != ""))), logs:$logs}' > "$gdir/../gates.json"
+  # Report gate: every path in the report's FILES section must exist in the working tree.
+  # A report that contradicts the diff fails here instead of in the judge's reading;
+  # changed files missing from FILES are logged as a warning.
+  local report="skip" rf missing=0 unlisted=0
+  if [ -f "$env_dir/arena-report.md" ]; then
+    report="pass"; : > "$gdir/report.log"
+    sed -n '/^FILES:/,/^[A-Z][A-Z ]*:/p' "$env_dir/arena-report.md" | sed '1d;$d' | sed -E 's/^[-* ]+//; s/[[:space:]]+$//' | grep -vE '^$|^<' | sed -E "s#^$REPO_REL/##" > "$gdir/report-files.txt" || true
+    while IFS= read -r rf; do
+      [ -n "$rf" ] || continue
+      [ -e "$wt_repo/$rf" ] || { missing=$((missing+1)); printf 'listed in FILES but absent from the tree: %s\n' "$rf" >> "$gdir/report.log"; }
+    done < "$gdir/report-files.txt"
+    while IFS= read -r rf; do
+      [ -n "$rf" ] || continue
+      grep -qxF "$rf" "$gdir/report-files.txt" || { unlisted=$((unlisted+1)); printf 'changed in the tree but not in FILES: %s\n' "$rf" >> "$gdir/report.log"; }
+    done < "$gdir/changed-files.txt"
+    [ "$missing" = "0" ] || report="fail"
+    [ "$unlisted" = "0" ] || printf '%s file(s) changed but not listed (warning only)\n' "$unlisted" >> "$gdir/report.log"
+  fi
+  jq -n --arg site "$site" --arg config "$config" --arg phpstan "$phpstan" --arg phpcs "$phpcs" --arg phpunit "$phpunit" --arg report "$report" --arg logs "$gdir" --arg targets "$targets" \
+    '{site:$site, config:$config, phpstan:$phpstan, phpcs:$phpcs, phpunit:$phpunit, report:$report, targets:($targets | split("\n") | map(select(. != ""))), logs:$logs}' > "$gdir/../gates.json"
   cand_set_json "$label" gates "$(jq 'del(.logs)' "$gdir/../gates.json")"
   jq -c . "$gdir/../gates.json"
 }
@@ -500,7 +521,13 @@ cmd_plan() {
   fi
   msg="${msg//\{\{APPROACHES\}\}/$block}"
   pm_call "$msg"
-  [ -s "$ARENA_DIR/brief.md" ] || die "the PM did not write $ARENA_DIR/brief.md (see arena/$SLUG/pm/*.log)"
+  if [ ! -s "$ARENA_DIR/brief.md" ]; then
+    # The usual cause: the PM delegated the plan to a background subagent that the harness
+    # killed. One retry, explicitly in the foreground, before giving up.
+    warn "the PM did not write brief.md; asking it once more to write it in the foreground"
+    pm_call "brief.md was not written (a background subagent was probably killed by the harness). Do NOT spawn background subagents. Write $CONTAINER_ARENA/brief.md yourself now, in this turn, from what you already read plus the task description in manifest.json, following the BRIEF FORMAT of the arena-protocol skill. Then reply with VERDICT: DONE."
+    [ -s "$ARENA_DIR/brief.md" ] || die "the PM did not write $ARENA_DIR/brief.md (see arena/$SLUG/pm/*.log)"
+  fi
   if [ "$(arena_mode)" = approaches ]; then
     for l in $(labels); do [ -s "$(approach_file "$l")" ] || warn "no approach for label $l yet ($(approach_file "$l")); settle it with 'ai-arena pm' before run"; done
     sync_approaches
@@ -554,9 +581,36 @@ cmd_resume() {
   launch_candidate "$l" "$msg"$'\n\n'"When done, rewrite $CONTAINER_ROOT/arena-report.md (STATUS first line) as before." 1
 }
 
+cmd_stop() { # kill a running candidate's harness; settle its state from the report written so far
+  mf_require "${1:-}"; shift || true
+  [ $# -gt 0 ] || die "usage: stop <slug> <label...>"
+  local l harness env_name env_dir container user st
+  for l in "$@"; do
+    guard_label "$l"
+    [ "$(cand_get "$l" '.state')" = "running" ] || { warn "candidate $l is not running"; continue; }
+    harness="$(cand_get "$l" '.harness')"; env_name="$(cand_get "$l" '.env_name')"; env_dir="$(cand_get "$l" '.env_dir')"
+    user="$(harness_user "$harness")"; container="$(container_for "$harness" "$env_name")"
+    if container_running "$container"; then
+      # Everything the harness user runs in that container belongs to this run (the wrapper,
+      # the harness, its subagents and tool processes). TERM first, KILL what survives.
+      docker exec -u root "$container" pkill -TERM -u "$user" >/dev/null 2>&1 || true
+      sleep 5
+      docker exec -u root "$container" pkill -KILL -u "$user" >/dev/null 2>&1 || true
+    else
+      warn "container $container is not running"
+    fi
+    # The wrapper writes arena-run.exit itself when it survives the kill; otherwise record it.
+    sleep 2
+    [ -f "$env_dir/arena-run.exit" ] || echo 143 > "$env_dir/arena-run.exit"
+    st="$(settle_candidate "$l")"
+    log "candidate $l stopped -> $st (exit $(cat "$env_dir/arena-run.exit"))"
+  done
+  status_json
+}
+
 cmd_wait() {
   mf_require "${1:-}"; shift || true
-  local all=0 timeout="$AI_ARENA_TIMEOUT" interval=15 start l st changed
+  local all=0 timeout="$AI_ARENA_WAIT_TIMEOUT" interval=15 start l st changed
   while [ $# -gt 0 ]; do case "$1" in --all) all=1; shift ;; --timeout) timeout="$2"; shift 2 ;; --interval) interval="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
   start="$(date +%s)"
   while :; do
@@ -765,7 +819,7 @@ need git; need jq; need ddev; need docker
 resolve_project
 case "$cmd" in
   doctor) cmd_doctor ;; up) cmd_up ;; init) cmd_init "$@" ;; plan) cmd_plan "$@" ;; spawn) cmd_spawn "$@" ;; run) cmd_run "$@" ;;
-  wait) cmd_wait "$@" ;; status) cmd_status "$@" ;; resume) cmd_resume "$@" ;; pm) cmd_pm "$@" ;; gate) cmd_gate "$@" ;;
+  wait) cmd_wait "$@" ;; stop) cmd_stop "$@" ;; status) cmd_status "$@" ;; resume) cmd_resume "$@" ;; pm) cmd_pm "$@" ;; gate) cmd_gate "$@" ;;
   collect) cmd_collect "$@" ;; judge) cmd_judge "$@" ;; promote) cmd_promote "$@" ;; reveal) cmd_reveal "$@" ;; clean) cmd_clean "$@" ;; list) cmd_list ;; review) cmd_review "$@" ;;
   *) die "unknown command '$cmd' (see ai-arena --help)" ;;
 esac

@@ -145,7 +145,8 @@ ai-arena clean add-a-handling-fee
 | `plan <slug>` | PM session runs `code-review` PLAN mode over `main/<repo>` and writes the brief |
 | `spawn <slug> [label...]` | `worktree-add --tmp` per candidate: worktree, DDEV project, DB, composer, provisioning |
 | `run <slug> [label...]` | Starts candidates detached on the brief |
-| `wait <slug> [--all] [--timeout S] [--interval S]` | Blocks until a state change (poll every `--interval` seconds, default 15); prints JSON |
+| `wait <slug> [--all] [--timeout S] [--interval S]` | Blocks until a state change, with no timeout unless `--timeout S` or `AI_ARENA_WAIT_TIMEOUT` (poll every `--interval` seconds, default 15); prints JSON |
+| `stop <slug> <label...>` | Kills a running candidate's harness (TERM, then KILL) and settles its state from the report it wrote; use it for a dead provider or a run that never exits |
 | `status <slug> [--json]` | Candidate states, gates, branches |
 | `resume <slug> <label> "<msg>"` | Continues a candidate's session (answers, new instructions) |
 | `pm <slug> "<msg>"` | Talks to the PM session; prints its parsed verdict |
@@ -248,7 +249,8 @@ coordinator's Playwright, a candidate's site is reachable at `http://ddev-<env_n
 
 `~/.ddev/ai-arena/config.env` (all projects, written by `install.sh`) and
 `<project>/ai-arena.env` (this project): candidate panel, PM harness and model, cap,
-timeout, database mode, base ref, extra local files, `AI_ARENA_MAIN_ENV`. Candidate
+review timeout (`AI_ARENA_TIMEOUT`), wait timeout (`AI_ARENA_WAIT_TIMEOUT`, `0` = wait
+forever, the default), database mode, base ref, extra local files, `AI_ARENA_MAIN_ENV`. Candidate
 models are applied through each environment's `.ddev/.env.agents` (the cascade
 `ddev-agents-sync` already honours) plus the harness's `--model` flag.
 

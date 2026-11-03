@@ -78,7 +78,7 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
 5. **Run.** `ai-arena run <slug>`. Detached; candidates keep working even if this
    session ends.
 6. **Wait loop.** `ai-arena wait <slug>` blocks until any candidate changes state
-   (`--all` for all). Run it in the background with a long timeout and react:
+   (`--all` for all; no timeout unless `--timeout S`). Run it in the background and react:
    - `DONE` → keep waiting for the rest.
    - `BLOCKED` → relay to the PM: `ai-arena pm <slug> "Candidate <label> is BLOCKED,
      see worktree-tmp/<env_name>/arena-report.md"`. On `VERDICT: ANSWER` or
@@ -88,21 +88,26 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
    - `FAILED` → read `worktree-tmp/<env_name>/arena-run.log` and the report; if the
      cause is environmental (container, DB), fix through `spawn`/`resume`; if the
      candidate gave up, leave it and continue.
+   - Still `running` long after its report says `STATUS: DONE`, or stuck on a dead
+     provider → `ai-arena stop <slug> <label>` kills the harness and settles the state
+     from the report; gate and judge it like any other finished candidate.
    - `PARTIAL` → treat like DONE for gating; the judge weighs it.
    Repeat until no candidate is `running`.
 7. **Gate and collect.** `ai-arena gate <slug>` then `ai-arena collect <slug>`. Gates
-   are mechanical (site bootstrap, PHPStan, PHPCS, PHPUnit on the changed custom
-   modules, inside each candidate's own project). Report the gate table to the user
-   before judging.
+   are mechanical (site bootstrap, config, PHPStan, PHPCS, PHPUnit on the changed custom
+   modules, and `report`: every path in the report's FILES exists in the tree), inside
+   each candidate's own project. Report the gate table to the user before judging.
 8. **Judge.** `ai-arena judge <slug>`. Blind: the PM sees labels and collected copies
    only. Read the ranking and graft suggestions. On `VERDICT: BLOCKED` (no acceptable
    candidate), report why and ask the user whether to resume the best one with the
    PM's instructions or stop.
-9. **Review the winner (optional, recommended for security or data changes).**
+9. **Review the winner (default step; skip only for trivial diffs).**
    `ai-arena review --env worktree-tmp/<winner env_name> --intent "<task>"` runs the
-   multi-model panel on the winner's working tree before it becomes a branch; put its
-   Act-on items to the user with the promotion decision, or resume the candidate with
-   them first.
+   multi-model panel on the winner's working tree before it becomes a branch. In every
+   arena so far the panel found defects the rubric could not express (per-entity
+   authorization, REST contract regressions, data corruption). Resume the winner with the
+   Act-on items (`ai-arena resume <slug> <winner> "..."`), re-gate, and only then promote;
+   put Consider items that are product calls to the user.
 10. **Promote and reveal.** `ai-arena promote <slug> <winner> [--env]` creates
    `feature/<slug>` in the main repository (with `--env`, also its environment under
    `worktree/`). Then `ai-arena reveal <slug>` shows which harness and model each
@@ -149,6 +154,8 @@ anything skipped. Keep model names out of the judgment narrative until reveal.
   Tell the user the branch carries one work-in-progress commit to review and squash.
 - If `wait` times out or this session is interrupted, `ai-arena status <slug>`
   reattaches: candidates ran detached and their state is on disk.
+- Never kill candidate processes by hand inside a container: `ai-arena stop` is the
+  only way, because the run wrapper that records the exit code must survive the kill.
 - Questions to the user are the exception. Most BLOCKED questions are answered by
   the PM from the brief; escalate only `ASK_USER` verdicts, spawn failures you cannot
   fix, and the final decision when no candidate is acceptable.
