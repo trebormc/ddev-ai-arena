@@ -597,9 +597,13 @@ cmd_init() {
   echo "$slug"
 }
 
+brief_lint() { # brief.md -> the lines candidates would trip on: lost ssh quoting, git in the container, literal test gates
+  grep -nE "ssh web drush (php:eval|ev|sqlq|sql:query) ['\"]|ssh web (ba)?sh -l?c|git (status|diff)|OK \([0-9]+ test" "$1" || true
+}
+
 cmd_plan() {
   mf_require "${1:-}"; shift || true
-  local description="${1:-$(mf_get '.description')}" msg block="" l
+  local description="${1:-$(mf_get '.description')}" msg block="" l hits
   msg="$(fill_prompt plan.md)"; msg="${msg//\{\{TASK\}\}/$description}"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
   if [ "$(arena_mode)" = approaches ]; then
     if ls "$ARENA_DIR"/approach-*.md >/dev/null 2>&1; then
@@ -623,6 +627,8 @@ cmd_plan() {
     for l in $(labels); do [ -s "$(approach_file "$l")" ] || warn "no approach for label $l yet ($(approach_file "$l")); settle it with 'ai-arena pm' before run"; done
     sync_approaches
   fi
+  hits="$(brief_lint "$ARENA_DIR/brief.md")"
+  [ -z "$hits" ] || warn "brief.md carries commands that fail or mislead in the candidates' containers; have the PM rewrite them with 'ai-arena pm' before spawn:"$'\n'"$hits"
   mf_update '.status = "planned"'; log "brief written: $ARENA_DIR/brief.md"
 }
 

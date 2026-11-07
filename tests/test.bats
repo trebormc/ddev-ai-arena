@@ -557,6 +557,33 @@ arena_fixture() { # harness
   assert_output "null"
 }
 
+@test "cli: brief_lint flags commands that fail in a candidate container" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions brief_lint)"
+  cat > "$TESTDIR/brief.md" <<'EOF'
+ssh web drush php:eval 'echo strlen("a");'
+ssh web drush sqlq "SELECT COUNT(*) FROM node"
+ssh web bash -lc 'cd app && npm run build'
+Run git status --short and paste it.
+Pass state: OK (9 tests, 12 assertions)
+ssh web 'drush php:eval "echo strlen(\"a\");"'
+ssh web drush php:script - <<'PHP'
+ssh web "cd app && npm run build"
+No git writes. Pass state: 0 failures.
+EOF
+  run brief_lint "$TESTDIR/brief.md"
+  assert_success
+  assert_equal "${#lines[@]}" 5
+  assert_line --index 0 --partial "1:ssh web drush php:eval"
+  assert_line --index 4 --partial "5:Pass state"
+
+  printf 'ssh web drush cr\n' > "$TESTDIR/clean.md"
+  run brief_lint "$TESTDIR/clean.md"
+  assert_success
+  assert_output ""
+}
+
 @test "cli: report_files parses FILES and undeclared_files finds what the report omits" {
   set -eu -o pipefail
   cli_env

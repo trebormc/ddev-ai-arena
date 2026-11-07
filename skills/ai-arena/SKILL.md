@@ -66,7 +66,7 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
    `arena/<slug>/approach-<label>.md`; `status`, `reveal` and the judge show them.
 3. **Plan.** `ai-arena plan <slug>`, in the background: it often takes over 20 minutes and a foreground call hits the tool timeout. The PM session (coordinator container) runs
    `code-review` in PLAN mode over `main/<repo>` and writes `arena/<slug>/brief.md`.
-   Read the brief. It must fix outcomes, interfaces and tests, not implementation bodies; a contract that dictates the code makes every candidate deliver the same thing, so send it back with `ai-arena pm`. On `VERDICT: ASK_USER`, put the question to the user, then
+   Read the brief. It must fix outcomes, interfaces and tests, not implementation bodies; a contract that dictates the code makes every candidate deliver the same thing, so send it back with `ai-arena pm`. Do the same with any line `plan` warns about: those commands fail in the candidates' containers. On `VERDICT: ASK_USER`, put the question to the user, then
    `ai-arena pm <slug> "<answer>"` and ask it to write the brief. Do not spawn without
    a brief.
 4. **Bring up layer 3.** `ai-arena spawn <slug>`. For each candidate, `worktree-add
