@@ -64,6 +64,7 @@ echo "  - DDEV project '$env_name' (containers and database)" >&2
 echo "  - git worktree $wt_repo${branch:+ (branch $branch)}" >&2
 echo "  - directory $dest" >&2
 if [ "$yes" = "0" ]; then
+  [ -t 0 ] || die "confirmation needed but there is no terminal: nothing was removed (repeat with -y)"
   read -r -p "Continue? [y/N] " answer
   case "$answer" in [yY]*) ;; *) echo "Cancelled." >&2; exit 0 ;; esac
 fi

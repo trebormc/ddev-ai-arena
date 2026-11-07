@@ -64,9 +64,9 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
    `plan` and replies `ASK_USER` with the list: put it to the user, send changes with
    `ai-arena pm <slug> "..."`, spawn only once the user confirms). Approaches live in
    `arena/<slug>/approach-<label>.md`; `status`, `reveal` and the judge show them.
-3. **Plan.** `ai-arena plan <slug>`. The PM session (coordinator container) runs
+3. **Plan.** `ai-arena plan <slug>`, in the background: it often takes over 20 minutes and a foreground call hits the tool timeout. The PM session (coordinator container) runs
    `code-review` in PLAN mode over `main/<repo>` and writes `arena/<slug>/brief.md`.
-   Read the brief. On `VERDICT: ASK_USER`, put the question to the user, then
+   Read the brief. It must fix outcomes, interfaces and tests, not implementation bodies; a contract that dictates the code makes every candidate deliver the same thing, so send it back with `ai-arena pm`. On `VERDICT: ASK_USER`, put the question to the user, then
    `ai-arena pm <slug> "<answer>"` and ask it to write the brief. Do not spawn without
    a brief.
 4. **Bring up layer 3.** `ai-arena spawn <slug>`. For each candidate, `worktree-add
@@ -95,8 +95,11 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
    Repeat until no candidate is `running`.
 7. **Gate and collect.** `ai-arena gate <slug>` then `ai-arena collect <slug>`. Gates
    are mechanical (site bootstrap, config, PHPStan, PHPCS, PHPUnit on the changed custom
-   modules, and `report`: every path in the report's FILES exists in the tree), inside
-   each candidate's own project. Report the gate table to the user before judging.
+   modules, and `report`: the report's FILES and the changed files match both ways), inside
+   each candidate's own project. A `report` failure usually means a stray file: read
+   `candidates/<label>/gates/report.log` and resume the candidate. Report the gate table to
+   the user before judging. If `collect` warns that the production code is identical, tell
+   the user: the arena measured discipline, not design.
 8. **Judge.** `ai-arena judge <slug>`. Blind: the PM sees labels and collected copies
    only. Read the ranking and graft suggestions. On `VERDICT: BLOCKED` (no acceptable
    candidate), report why and ask the user whether to resume the best one with the
@@ -107,13 +110,17 @@ comes next and read JSON. `ai-arena status <slug> --json` is the source of truth
    arena so far the panel found defects the rubric could not express (per-entity
    authorization, REST contract regressions, data corruption). Resume the winner with the
    Act-on items (`ai-arena resume <slug> <winner> "..."`), re-gate, and only then promote;
-   put Consider items that are product calls to the user.
+   put Consider items that are product calls to the user. A resume is a new round: tell
+   the user that later rounds improve the winner and are not part of the comparison.
 10. **Promote and reveal.** `ai-arena promote <slug> <winner> [--env]` creates
    `feature/<slug>` in the main repository (with `--env`, also its environment under
-   `worktree/`). Then `ai-arena reveal <slug>` shows which harness and model each
-   label was and logs the win to `~/.ddev/ai-arena/wins.tsv`.
+   `worktree/`). It refuses files the report does not declare: remove them through a
+   resume, or pass `--allow-undeclared` only when they belong. Then `ai-arena reveal <slug>`
+   shows which harness and model each label was and logs the win to
+   `~/.ddev/ai-arena/wins.tsv`, and `ai-arena compare <slug>` prints time, steps, tokens and
+   cost per round plus tests and gates: use it for the comparison table you report.
 11. **Clean.** `ai-arena clean <slug>` removes the candidates under `worktree-tmp/`
-    and their `tmp/*` branches (the winner's branch is kept). Ask the user only if a
+    and their `tmp/*` branches (the winner's too, once `feature/<slug>` contains it). Ask the user only if a
     candidate is still running or they asked to keep losers.
 
 ## Multi-model review (no arena)
@@ -131,9 +138,11 @@ first, then Consider, and name which reviews agreed.
   remote, or new branch), with the database and provisioning as above. Options:
   `--db snapshot|latest|file:<path>|export|none`, `--name`, `--base-ref`.
 - `worktree-remove <branch|name|dir>` deletes containers, worktree, directory, and
-  the branch (`--keep-branch` to keep it; `-f` with uncommitted changes, only after
-  the user confirms). It refuses `main/` and anything outside `worktree/` and
-  `worktree-tmp/`.
+  the branch (`--keep-branch` to keep it; `-y` when there is no terminal; `-f` with
+  uncommitted changes, only after the user confirms). It refuses `main/` and anything
+  outside `worktree/` and `worktree-tmp/`.
+- `host-skills-sync` links the skills of `AI_ARENA_HOST_SKILL_REPOS` (extra, usually
+  private, agent repositories) into the host harnesses; `--list` shows them.
 
 ## Reporting to the user
 

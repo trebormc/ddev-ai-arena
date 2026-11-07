@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Link the skills of extra agent repositories (usually a private one) into the host
+# harnesses, so the host agent that drives ai-arena can use them. Containers do not
+# need this: they get their agents through ddev-agents-sync and AGENTS_REPOS.
+#
+# Usage: host-skills-sync [--list]
+#   --list   show the linked skills and exit
+#
+# Reads AI_ARENA_HOST_SKILL_REPOS from ~/.ddev/ai-arena/config.env: a comma-separated
+# list of local directories or git URLs (url#ref), each with .claude/skills/<name>/SKILL.md.
+# Later repositories win. A local directory is linked live: edits apply at once. A URL is
+# cloned into ~/.ddev/ai-arena/host-repos/ and updated on every run.
+set -euo pipefail
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+BASE="$HOME/.ddev/ai-arena"
+CONFIG="$BASE/config.env"
+STATE="$BASE/host-skills.txt"
+REPOS="$BASE/host-repos"
+AI_ARENA_HOST_SKILL_REPOS=""
+
+case "${1:-}" in
+  "") ;;
+  --list) [ -f "$STATE" ] && cut -f1,2 "$STATE"; exit 0 ;;
+  -h|--help) usage; exit 0 ;;
+  *) die "unknown option $1" ;;
+esac
+
+# shellcheck disable=SC1090
+if [ -f "$CONFIG" ]; then set -a; . "$CONFIG"; set +a; fi
+
+targets=("$HOME/.claude/skills" "$HOME/.config/opencode/skills")
+
+repo_dir() { # spec -> local directory holding the repository
+  local spec="$1" url ref name dir
+  case "$spec" in
+    *://*|*@*:*)
+      url="${spec%%#*}"; ref=""; [ "$url" != "$spec" ] && ref="${spec#*#}"
+      name="$(basename "$url" .git)"; dir="$REPOS/$name"
+      if [ -d "$dir/.git" ]; then
+        git -C "$dir" pull -q --ff-only >&2 || warn "could not update $url; using the existing copy"
+      else
+        mkdir -p "$REPOS"
+        git clone -q ${ref:+--branch "$ref"} --depth 1 "$url" "$dir" >&2 || { warn "could not clone $url"; return 1; }
+      fi
+      printf '%s' "$dir" ;;
+    *)
+      dir="${spec/#\~/$HOME}"
+      [ -d "$dir" ] || { warn "not a directory: $dir"; return 1; }
+      (cd "$dir" && pwd) ;;
+  esac
+}
+
+new_state="$(mktemp)"
+trap 'rm -f "$new_state"' EXIT
+IFS=',' read -r -a specs <<< "$AI_ARENA_HOST_SKILL_REPOS"
+for spec in ${specs[@]+"${specs[@]}"}; do
+  spec="$(printf '%s' "$spec" | tr -d '[:space:]')"; [ -n "$spec" ] || continue
+  dir="$(repo_dir "$spec")" || continue
+  shopt -s nullglob
+  for skill in "$dir"/.claude/skills/*/SKILL.md; do
+    src="$(dirname "$skill")"; name="$(basename "$src")"
+    [ "$name" != "ai-arena" ] || { warn "skipping $src: ai-arena is installed by install.sh"; continue; }
+    # Later repositories win: drop the earlier entry for this name.
+    if grep -q "^$name"$'\t' "$new_state"; then sed -i "/^$name\t/d" "$new_state"; fi
+    printf '%s\t%s\n' "$name" "$src" >> "$new_state"
+  done
+  shopt -u nullglob
+done
+
+# Stale links: skills this script linked earlier that no repository offers any more.
+if [ -f "$STATE" ]; then
+  while IFS=$'\t' read -r name _; do
+    [ -n "$name" ] || continue
+    grep -q "^$name"$'\t' "$new_state" && continue
+    for t in "${targets[@]}"; do
+      if [ -L "$t/$name" ]; then rm -f "$t/$name"; echo "removed $t/$name"; fi
+    done
+  done < "$STATE"
+fi
+
+while IFS=$'\t' read -r name src; do
+  for t in "${targets[@]}"; do
+    [ -d "$(dirname "$t")" ] || continue
+    mkdir -p "$t"
+    if [ -e "$t/$name" ] && [ ! -L "$t/$name" ]; then
+      warn "$t/$name exists and is not a link; leaving it"
+      continue
+    fi
+    ln -sfn "$src" "$t/$name"
+    echo "linked $t/$name -> $src"
+  done
+done < "$new_state"
+
+mkdir -p "$BASE"
+cp "$new_state" "$STATE"

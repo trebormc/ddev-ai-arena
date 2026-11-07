@@ -84,7 +84,7 @@ Once on the host:
 
 ```bash
 git clone https://github.com/trebormc/ddev-ai-arena.git
-cd ddev-ai-arena && ./install.sh     # copies the skill to ~/.claude/skills and ~/.config/opencode/skills, links ai-arena, worktree-add and worktree-remove into ~/.local/bin
+cd ddev-ai-arena && ./install.sh     # copies the skill to ~/.claude/skills and ~/.config/opencode/skills, links ai-arena, worktree-add, worktree-remove and host-skills-sync into ~/.local/bin
 ```
 
 Once per project, create the coordinator. Two DDEV rules shape the order:
@@ -134,6 +134,7 @@ ai-arena gate add-a-handling-fee && ai-arena collect add-a-handling-fee
 ai-arena judge add-a-handling-fee       # blind, gates first
 ai-arena promote add-a-handling-fee b --env
 ai-arena reveal add-a-handling-fee
+ai-arena compare add-a-handling-fee     # time, steps, tokens and cost per round, tests, gates
 ai-arena clean add-a-handling-fee
 ```
 
@@ -152,10 +153,11 @@ ai-arena clean add-a-handling-fee
 | `pm <slug> "<msg>"` | Talks to the PM session; prints its parsed verdict |
 | `gate <slug> [label...]` | Site bootstrap, config (unexported config changes fail unless the brief says `Config changes: allowed`), PHPStan, PHPCS, PHPUnit on changed custom modules, inside each candidate |
 | `collect <slug>` | Diffs, reports, gates into `arena/<slug>/candidates/` (no model info) |
+| `compare <slug> [--json]` | Time, steps, tokens and cost per round and in total, tests and failed gates, by label; flags candidates whose production code is identical. Each run and resume is one round, kept under `arena/<slug>/rounds/` |
 | `judge <slug>` | PM judges blind: gates, rubric, conformance, then quality |
-| `promote <slug> <label> [--branch] [--env]` | Records the candidate's working tree as one commit on its `tmp/` branch (candidates never commit), then creates `feature/<slug>` from it; `--env` also creates its environment under `worktree/` |
+| `promote <slug> <label> [--branch] [--env] [--allow-undeclared]` | Refuses files the winner's report does not declare, then records the candidate's working tree as one commit on its `tmp/` branch (candidates never commit), then creates `feature/<slug>` from it; `--env` also creates its environment under `worktree/` |
 | `reveal <slug>` | Label → harness/model/agents with cost and duration, appends to the wins log |
-| `clean <slug> [--keep label] [--purge]` | Deletes candidates under `worktree-tmp/` and their `tmp/*` branches; refuses when the judge picked a winner that was not promoted yet |
+| `clean <slug> [--keep label] [--purge]` | Deletes candidates under `worktree-tmp/` and their `tmp/*` branches (the winner's too, once the promoted branch contains it); refuses when the judge picked a winner that was not promoted yet |
 | `list` | Arenas in this project |
 | `review (--branch <b> \| --env <dir> \| --patch <file>) [--reviewers a,b] [--intent "..."]` | Multi-model review of one diff: independent reviewers on different harnesses/models in the coordinator's containers, then a lead synthesis (act on / consider / noted / dismissed); no worktrees needed |
 
@@ -254,6 +256,24 @@ forever, the default), database mode, base ref, extra local files, `AI_ARENA_MAI
 models are applied through each environment's `.ddev/.env.agents` (the cascade
 `ddev-agents-sync` already honours) plus the harness's `--model` flag.
 
+
+### Skills from a private repository
+
+`install.sh` installs the `ai-arena` skill on the host. If you keep your own agents repository
+(public or private), the host agent can use its skills too, which is the place for anything
+that needs the whole workspace rather than one project. List the repositories in
+`~/.ddev/ai-arena/config.env`:
+
+```bash
+# Local directories (linked live) or git URLs (url#ref, cloned under ~/.ddev/ai-arena/host-repos/).
+AI_ARENA_HOST_SKILL_REPOS=~/repos/my-private-agents,git@github.com:me/more-agents.git
+```
+
+Then run `host-skills-sync` (`install.sh` also runs it). Each `.claude/skills/<name>/` is linked
+into `~/.claude/skills/` and `~/.config/opencode/skills/`; later repositories win, an existing
+directory that is not a link is left alone, and skills that disappear are unlinked. This is
+optional and independent of `AGENTS_REPOS`, which ddev-agents-sync uses for the containers.
+
 ## Part of DDEV AI Workspace
 
 | Repository | Description | Relationship |
@@ -266,7 +286,7 @@ models are applied through each environment's `.ddev/.env.agents` (the cascade
 | [ddev-beads](https://github.com/trebormc/ddev-beads) | [Beads](https://github.com/steveyegge/beads) git-backed task tracker. | Candidates skip it; the main environment keeps the task |
 | [ddev-playwright-mcp](https://github.com/trebormc/ddev-playwright-mcp) | Headless Playwright browser. | Candidates verify on their own browser; the coordinator can open their sites |
 | [ddev-ai-ssh](https://github.com/trebormc/ddev-ai-ssh) | SSH access to the web container. | Each environment gets its own keys |
-| [drupal-ai-agents](https://github.com/trebormc/drupal-ai-agents) | 11 agents, 15 rules, 39 skills for Drupal development. | Provides the `arena-protocol` skill |
+| [drupal-ai-agents](https://github.com/trebormc/drupal-ai-agents) | 11 agents, 15 rules, 38 skills for Drupal development. | Provides the `arena-protocol` skill |
 
 ## Disclaimer
 

@@ -6,6 +6,8 @@
 #   --claude     ~/.claude/skills/ai-arena/
 #   --opencode   ~/.config/opencode/skills/ai-arena/
 #   --bin        ~/.local/bin/ai-arena -> the installed CLI
+#
+# Skills from extra repositories (AI_ARENA_HOST_SKILL_REPOS in config.env) are linked at the end.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/skills/ai-arena"
@@ -20,7 +22,7 @@ if [ $# -eq 0 ]; then do_claude=1; do_opencode=1; do_bin=1; fi
 for a in "$@"; do
   case "$a" in
     --claude) do_claude=1 ;; --opencode) do_opencode=1 ;; --bin) do_bin=1 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option $a" >&2; exit 1 ;;
   esac
 done
@@ -28,7 +30,7 @@ done
 install_to() { # dest
   mkdir -p "$1"
   cp -a "$SRC"/. "$1"/
-  chmod +x "$1"/scripts/ai-arena "$1"/scripts/worktree-add "$1"/scripts/worktree-remove
+  chmod +x "$1"/scripts/ai-arena "$1"/scripts/worktree-add "$1"/scripts/worktree-remove "$1"/scripts/host-skills-sync
   echo "installed skill to $1"
 }
 
@@ -38,7 +40,7 @@ first=""
 
 if [ "$do_bin" = "1" ]; then
   mkdir -p "$HOME/.local/bin"
-  for tool in ai-arena worktree-add worktree-remove; do
+  for tool in ai-arena worktree-add worktree-remove host-skills-sync; do
     target="${first:-$SRC}/scripts/$tool"
     ln -sfn "$target" "$HOME/.local/bin/$tool"
     echo "linked $HOME/.local/bin/$tool -> $target"
@@ -83,8 +85,14 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 
 # Repository a candidate's short "@<branch>" agents pin refers to.
 #AI_ARENA_AGENTS_REPO=https://github.com/trebormc/drupal-ai-agents.git
+
+# Extra agent repositories whose skills are linked into the HOST harnesses, for example a
+# private one: comma-separated local directories or git URLs (url#ref). Run host-skills-sync
+# after changing this. Containers keep using AGENTS_REPOS (ddev-agents-sync).
+#AI_ARENA_HOST_SKILL_REPOS=~/repos/my-private-agents
 EOF
   echo "wrote $HOME/.ddev/ai-arena/config.env (defaults, all commented)"
 fi
 
+bash "${first:-$SRC}/scripts/host-skills-sync"
 echo "done. Open your host harness in a coordinator project and run: ai-arena doctor"

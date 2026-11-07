@@ -17,7 +17,7 @@
 set -euo pipefail
 shopt -u patsub_replacement 2>/dev/null || true
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PROMPTS_DIR="$SCRIPT_DIR/../prompts"
 CONTAINER_ROOT="/var/www/html"
@@ -80,13 +80,16 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   resume <slug> <label> "<message>"        Continue a candidate's session with a message
   pm <slug> "<message>"                    Send a message to the PM session, print its verdict
   gate <slug> [label...]                   Mechanical gates (site, config, phpstan, phpcs, phpunit,
-                                           report: every FILES entry of the report exists in the tree)
+                                           report: FILES in the report and the changed files match both ways)
   collect <slug>                           Gather diffs, reports and gates into arena/<slug>/candidates/
+  compare <slug> [--json]                  Per-round time, steps, tokens and cost, tests and gates, by label
   judge <slug>                             PM judges the collected candidates (blind)
-  promote <slug> <label> [--branch name] [--env]
-                                           feature/<slug> from the winner (optionally its environment)
+  promote <slug> <label> [--branch name] [--env] [--allow-undeclared]
+                                           feature/<slug> from the winner (optionally its environment);
+                                           refuses files the winner's report does not declare
   reveal <slug>                            Label -> harness/model, log the win
-  clean <slug> [--keep label] [--purge]    Delete candidate environments and tmp/ branches
+  clean <slug> [--keep label] [--purge]    Delete candidate environments and tmp/ branches (the winner's
+                                           tmp/ branch too, once the promoted branch contains it)
   list                                     Arenas in this project
   review (--branch <b> | --env <dir> | --patch <file>) [--reviewers a,b] [--intent "..."] [--timeout S]
                                            Multi-model review of one diff: independent reviewers, then a lead synthesis
@@ -213,6 +216,37 @@ result_text() { # harness file
   esac
 }
 
+# Usage of one harness run as JSON: {steps,input,output,cache_read,cache_write,cost_usd}.
+# Claude Code: steps are the main session's turns (subagents have their own, not reported);
+# tokens and cost cover the subagents too. OpenCode: one step per model call, reasoning
+# counts as output. A field the harness does not report stays null; a free model costs 0.
+run_usage() { # harness file
+  [ -s "$2" ] || { echo null; return 0; }
+  case "$1" in
+    claude)
+      jq -c 'if type=="array" then (map(select(.total_cost_usd? != null)) | last // {}) else . end
+        | ((.modelUsage // {}) | to_entries | map(.value)) as $m
+        | def total(k): if ($m | length) > 0 then ($m | map(.[k] // 0) | add) else null end;
+          {steps:(.num_turns // null),
+           input:(total("inputTokens") // .usage.input_tokens // null),
+           output:(total("outputTokens") // .usage.output_tokens // null),
+           cache_read:(total("cacheReadInputTokens") // .usage.cache_read_input_tokens // null),
+           cache_write:(total("cacheCreationInputTokens") // .usage.cache_creation_input_tokens // null),
+           cost_usd:(.total_cost_usd // null)}' "$2" 2>/dev/null || echo null ;;
+    opencode)
+      { jq -R 'fromjson? // empty' "$2" 2>/dev/null || true; } | jq -c -s '
+        map(select(.type == "step_finish") | .part) as $s
+        | if ($s | length) == 0 then null else
+          {steps:($s | length),
+           input:($s | map(.tokens.input // 0) | add),
+           output:($s | map((.tokens.output // 0) + (.tokens.reasoning // 0)) | add),
+           cache_read:($s | map(.tokens.cache.read // 0) | add),
+           cache_write:($s | map(.tokens.cache.write // 0) | add),
+           cost_usd:($s | map(.cost // 0) | add)} end' 2>/dev/null || echo null ;;
+    *) echo null ;;
+  esac
+}
+
 parse_verdict() { # text_file -> json
   local f="$1" verdict to winner message
   verdict="$(grep -E '^VERDICT:' "$f" | tail -n1 | sed -E 's/^VERDICT:[[:space:]]*//' || true)"
@@ -304,6 +338,26 @@ launch_candidate() { # label prompt_text resume(0|1)
   log "candidate $label running in $container ($harness${model:+ $model}${session:+, resumed})"
 }
 
+# One entry per run of a candidate (run, then each resume) in .candidates[].rounds, with its
+# raw output kept in arena/<slug>/rounds/. duration_s and cost_usd are the sums of the rounds.
+# The end time is when the run wrote its exit file, not when a later `wait` noticed it.
+record_round() { # label harness exit_code status
+  local label="$1" harness="$2" code="$3" status="$4" env_dir started end dur n usage round
+  env_dir="$(cand_get "$label" '.env_dir')"; started="$(cand_get "$label" '.started // empty')"
+  end="$(stat -c %Y "$env_dir/arena-run.exit" 2>/dev/null || date -u +%s)"
+  dur=null; [ -n "$started" ] && dur=$(( end - $(date -u -d "$started" +%s) ))
+  n=$(( $(cand_get "$label" '.rounds // [] | length') + 1 ))
+  mkdir -p "$ARENA_DIR/rounds"; cp "$env_dir/arena-run.json" "$ARENA_DIR/rounds/$label-$n.json" 2>/dev/null || true
+  usage="$(run_usage "$harness" "$env_dir/arena-run.json")"; [ -n "$usage" ] || usage=null
+  round="$(jq -cn --argjson n "$n" --arg s "$started" --arg f "$(date -u -d "@$end" +%Y-%m-%dT%H:%M:%SZ)" --argjson d "$dur" --arg c "$code" --arg st "$status" --argjson u "$usage" \
+    '{round:$n, started:$s, finished:$f, duration_s:$d, exit_code:$c, status:$st} + (if $u == null then {steps:null, input:null, output:null, cache_read:null, cache_write:null, cost_usd:null} else $u end)')"
+  cand_set "$label" finished "$(date -u -d "@$end" +%Y-%m-%dT%H:%M:%SZ)"
+  mf_update --arg l "$label" --argjson r "$round" '
+    (.candidates[] | select(.label==$l)) |= (.rounds = ((.rounds // []) + [$r])
+      | .duration_s = ([.rounds[].duration_s // 0] | add)
+      | .cost_usd = ([.rounds[].cost_usd | select(. != null)] as $c | if ($c | length) > 0 then ($c | add) else null end))'
+}
+
 settle_candidate() { # label -> prints new state
   local label="$1" env_dir harness exit_code report status="" session
   env_dir="$(cand_get "$label" '.env_dir')"; harness="$(cand_get "$label" '.harness')"
@@ -313,21 +367,14 @@ settle_candidate() { # label -> prints new state
   report="$env_dir/arena-report.md"
   if [ -f "$report" ]; then status="$( { grep -E '^STATUS:' "$report" || true; } | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"; fi
   case "$status" in DONE|BLOCKED|FAILED|PARTIAL) ;; *) status="FAILED" ;; esac
-  cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"; cand_set "$label" finished "$(now)"
-  # Cost when the harness reports it (Claude Code JSON). Duration is always wall clock from the
-  # manifest timestamps: the harness's own duration_ms covers one call, not the whole run.
-  local cost dur started
-  cost="$( { jq -r 'if type=="array" then (.[] | select(.total_cost_usd?) | .total_cost_usd) else (.total_cost_usd // empty) end' "$env_dir/arena-run.json" 2>/dev/null || true; } | head -n1 || true)"
-  started="$(cand_get "$label" '.started // empty')"
-  if [ -n "$started" ]; then dur=$(( $(date -u +%s) - $(date -u -d "$started" +%s) )); else dur=""; fi
-  [ -n "$cost" ] && cand_set_json "$label" cost_usd "$cost"
-  [ -n "$dur" ] && cand_set_json "$label" duration_s "$dur"
+  cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"
+  record_round "$label" "$harness" "$exit_code" "$status"
   echo "$status"
 }
 
 status_json() {
   jq '{slug, status, description, mode:(.mode // "models"), coordinator, project, main_env, pm:{harness:.pm.harness, model:.pm.model, session:(.pm.session != null)},
-       candidates:[.candidates[] | {label, harness, model, agents, approach, branch, env_name, env_dir, state, exit_code, session:(.session != null), gates, cost_usd, duration_s}], judge, winner}' "$MANIFEST"
+       candidates:[.candidates[] | {label, harness, model, agents, approach, branch, env_name, env_dir, state, exit_code, session:(.session != null), gates, cost_usd, duration_s, rounds}], judge, winner}' "$MANIFEST"
 }
 
 status_table() {
@@ -343,6 +390,49 @@ status_table() {
 # ---------------------------------------------------------------------------
 changed_files() { # wt_repo
   { git -C "$1" diff --name-only HEAD; git -C "$1" ls-files --others --exclude-standard; } 2>/dev/null | sort -u || true
+}
+
+report_files() { # report -> the FILES section, one path per line, relative to the repository
+  sed -n '/^FILES:/,/^[A-Z][A-Z ]*:/p' "$1" | sed '1d;$d' | sed -E 's/^[-* ]+//; s/[[:space:]]+$//' | { grep -vE '^$|^<' || true; } | sed -E "s#^$REPO_REL/##"
+}
+
+undeclared_files() { # changed_list report_list -> changed paths the report does not list
+  { grep -vxFf "$2" "$1" || true; } | { grep -v '^$' || true; }
+}
+
+# Hash of a diff without tests, docs and translations: equal hashes mean the candidates
+# delivered the same production code, so the arena did not compare what they would build.
+production_hash() { # diff.patch -> sha256, empty when nothing is left
+  local out
+  out="$(awk '/^diff --git /{keep = !($0 ~ /\/tests\/|\.md( |$)|\.po( |$)/)} keep && !/^index /' "$1")"
+  if [ -n "$out" ]; then printf '%s' "$out" | sha256sum | cut -d' ' -f1; fi
+}
+
+identical_production() { # prints "yes" when every collected candidate has the same production code
+  local f h first="" n=0
+  shopt -s nullglob
+  for f in "$ARENA_DIR"/candidates/*/diff.patch; do
+    h="$(production_hash "$f")"
+    if [ -z "$h" ] || { [ -n "$first" ] && [ "$h" != "$first" ]; }; then shopt -u nullglob; return 0; fi
+    first="$h"; n=$((n + 1))
+  done
+  shopt -u nullglob
+  if [ "$n" -gt 1 ]; then echo yes; fi
+}
+
+phpunit_totals() { # gates_dir -> {tests,assertions,failures,errors} summed over the phpunit logs, or null
+  local f line t=0 a=0 fa=0 e=0 seen=0 v
+  for f in "$1"/phpunit-*.log; do
+    [ -f "$f" ] || continue
+    line="$(grep -E '^(OK \([0-9]+ tests?, [0-9]+ assertions?\)|Tests: [0-9]+, Assertions: [0-9]+)' "$f" | tail -n1 || true)"
+    [ -n "$line" ] || continue
+    seen=1
+    t=$(( t + $(printf '%s' "$line" | grep -oE '(^OK \(|Tests: )[0-9]+' | grep -oE '[0-9]+') ))
+    a=$(( a + $(printf '%s' "$line" | grep -oE '[0-9]+ assertions?|Assertions: [0-9]+' | grep -oE '[0-9]+') ))
+    v="$(printf '%s' "$line" | grep -oE 'Failures: [0-9]+' | grep -oE '[0-9]+' || true)"; fa=$(( fa + ${v:-0} ))
+    v="$(printf '%s' "$line" | grep -oE 'Errors: [0-9]+' | grep -oE '[0-9]+' || true)"; e=$(( e + ${v:-0} ))
+  done
+  if [ "$seen" = "1" ]; then printf '{"tests":%s,"assertions":%s,"failures":%s,"errors":%s}' "$t" "$a" "$fa" "$e"; else echo null; fi
 }
 
 run_gate() { # env_dir container_dir logfile cmd... -> pass|fail
@@ -390,23 +480,23 @@ gate_candidate() { # label
       [ "$any" = "1" ] || phpunit="skip"
     fi
   fi
-  # Report gate: every path in the report's FILES section must exist in the working tree.
-  # A report that contradicts the diff fails here instead of in the judge's reading;
-  # changed files missing from FILES are logged as a warning.
+  # Report gate: FILES and the tree must match both ways. A listed path that does not exist
+  # means the report contradicts the diff; a changed path that is not listed is a file nobody
+  # declared (a scratch database, a stray log), which `git add -A` would carry into the branch.
   local report="skip" rf missing=0 unlisted=0
   if [ -f "$env_dir/arena-report.md" ]; then
     report="pass"; : > "$gdir/report.log"
-    sed -n '/^FILES:/,/^[A-Z][A-Z ]*:/p' "$env_dir/arena-report.md" | sed '1d;$d' | sed -E 's/^[-* ]+//; s/[[:space:]]+$//' | grep -vE '^$|^<' | sed -E "s#^$REPO_REL/##" > "$gdir/report-files.txt" || true
+    report_files "$env_dir/arena-report.md" > "$gdir/report-files.txt"
     while IFS= read -r rf; do
       [ -n "$rf" ] || continue
+      grep -qxF "$rf" "$gdir/changed-files.txt" && continue
       [ -e "$wt_repo/$rf" ] || { missing=$((missing+1)); printf 'listed in FILES but absent from the tree: %s\n' "$rf" >> "$gdir/report.log"; }
     done < "$gdir/report-files.txt"
     while IFS= read -r rf; do
       [ -n "$rf" ] || continue
-      grep -qxF "$rf" "$gdir/report-files.txt" || { unlisted=$((unlisted+1)); printf 'changed in the tree but not in FILES: %s\n' "$rf" >> "$gdir/report.log"; }
-    done < "$gdir/changed-files.txt"
-    [ "$missing" = "0" ] || report="fail"
-    [ "$unlisted" = "0" ] || printf '%s file(s) changed but not listed (warning only)\n' "$unlisted" >> "$gdir/report.log"
+      unlisted=$((unlisted+1)); printf 'changed in the tree but not in FILES: %s\n' "$rf" >> "$gdir/report.log"
+    done < <(undeclared_files "$gdir/changed-files.txt" "$gdir/report-files.txt")
+    { [ "$missing" = "0" ] && [ "$unlisted" = "0" ]; } || report="fail"
   fi
   jq -n --arg site "$site" --arg config "$config" --arg phpstan "$phpstan" --arg phpcs "$phpcs" --arg phpunit "$phpunit" --arg report "$report" --arg logs "$gdir" --arg targets "$targets" \
     '{site:$site, config:$config, phpstan:$phpstan, phpcs:$phpcs, phpunit:$phpunit, report:$report, targets:($targets | split("\n") | map(select(. != ""))), logs:$logs}' > "$gdir/../gates.json"
@@ -447,6 +537,7 @@ cmd_doctor() {
   shopt -s nullglob; local snaps=("$MAIN_ENV"/.ddev/db_snapshots/baseline*); shopt -u nullglob
   [ ${#snaps[@]} -gt 0 ] && echo "ok    db snapshot 'baseline' in the main environment" || echo "info  no 'baseline' snapshot: candidates use the newest backups/ dump or an export of main"
   echo "info  free disk: $(df -h "$PROJECT" | awk 'NR==2{print $4}')"
+  if [ -n "${AI_ARENA_HOST_SKILL_REPOS:-}" ]; then echo "info  host skill repos: $AI_ARENA_HOST_SKILL_REPOS (host-skills-sync --list)"; fi
   return $ok
 }
 
@@ -637,7 +728,48 @@ cmd_pm() { mf_require "${1:-}"; shift || true; [ -n "${1:-}" ] || die "usage: pm
 
 cmd_gate() { mf_require "${1:-}"; shift || true; local l; for l in $(resolve_labels "$@"); do guard_label "$l"; [ -d "$(cand_get "$l" '.env_dir')" ] || { warn "$l has no environment"; continue; }; gate_candidate "$l"; done; }
 
-cmd_collect() { mf_require "${1:-}"; shift || true; local l; for l in $(labels); do [ -d "$(cand_get "$l" '.env_dir')" ] || continue; collect_candidate "$l"; done; mf_update '.status = "collected"'; }
+cmd_collect() {
+  mf_require "${1:-}"; shift || true
+  local l; for l in $(labels); do [ -d "$(cand_get "$l" '.env_dir')" ] || continue; collect_candidate "$l"; done
+  mf_update '.status = "collected"'
+  if [ "$(identical_production)" = "yes" ]; then
+    warn "every candidate delivered the same production code: the brief probably dictated it, so this arena did not compare implementations"
+  fi
+}
+
+compare_json() {
+  local l tests rows="[]"
+  for l in $(labels); do
+    tests="$(phpunit_totals "$ARENA_DIR/candidates/$l/gates")"
+    rows="$(jq -c --argjson r "$rows" --arg l "$l" --argjson t "$tests" '
+      [.candidates[] | select(.label==$l)] | first as $c
+      | ($c.rounds // []) as $rounds
+      | def tok(x): ($rounds | map(x // 0) | add // 0);
+      $r + [{label:$l, state:$c.state, rounds:$rounds, duration_s:$c.duration_s, cost_usd:$c.cost_usd,
+             steps:tok(.steps), tokens:(tok(.input) + tok(.output) + tok(.cache_read) + tok(.cache_write)),
+             tests:$t, gates:(if $c.gates then ($c.gates | del(.targets)) else null end)}]' "$MANIFEST")"
+  done
+  jq -n --arg slug "$SLUG" --arg same "$(identical_production)" --argjson c "$rows" '{slug:$slug, identical_production_code:($same == "yes"), candidates:$c}'
+}
+
+cmd_compare() {
+  mf_require "${1:-}"; shift || true
+  local data; data="$(compare_json)"
+  if [ "${1:-}" = "--json" ]; then printf '%s\n' "$data"; return 0; fi
+  echo "arena: $SLUG"
+  if [ "$(jq -r .identical_production_code <<< "$data")" = "true" ]; then echo "note: every candidate delivered the same production code"; fi
+  printf '%-6s %-6s %-11s %-6s %-14s %-9s\n' LABEL ROUND TIME STEPS TOKENS COST
+  jq -r 'def hm: if . == null then "-" else "\(. / 3600 | floor) h \(((. % 3600) / 60 + 0.5) | floor) min" end;
+    def money: if . == null then "-" else "$" + ((. * 100 | round) / 100 | tostring) end;
+    def sum4: [.input, .output, .cache_read, .cache_write] | if all(. == null) then null else map(. // 0) | add end;
+    .candidates[] | . as $c
+    | ((.rounds[]? | [$c.label, (.round | tostring), (.duration_s | hm), (.steps // "-" | tostring), (sum4 // "-" | tostring), (.cost_usd | money)]),
+       [$c.label, "total", ($c.duration_s | hm), ($c.steps | tostring), ($c.tokens | tostring), ($c.cost_usd | money)]) | @tsv' <<< "$data" \
+    | while IFS=$'\t' read -r l r t st to c; do printf '%-6s %-6s %-11s %-6s %-14s %-9s\n' "$l" "$r" "$t" "$st" "$to" "$c"; done
+  jq -r '.candidates[] | "\(.label): " + (if .tests then "\(.tests.tests) tests, \(.tests.failures) failures, \(.tests.errors) errors" else "no test run" end)
+    + "; gates: " + (if .gates then ([.gates | to_entries[] | select(.key != "logs" and .value == "fail") | .key] | if length == 0 then "all pass" else "failed " + join(", ") end) else "not run" end)' <<< "$data"
+  echo "steps: main session turns for Claude Code (subagents excluded), model calls for OpenCode."
+}
 
 cmd_judge() {
   mf_require "${1:-}"; shift || true
@@ -646,21 +778,32 @@ cmd_judge() {
   if [ "$(arena_mode)" = approaches ]; then
     block="APPROACHES MODE: each label was ASSIGNED its approach ($(approaches_summary); full texts in $CONTAINER_ARENA/approach-<label>.md). The candidates did not choose them, so judge the approaches as implemented: contract conformance, size and reader load of the change, test footprint, config churn, risk and maintainability. The winner is the approach to adopt. Do not penalise a label for following its assigned approach; do penalise one that abandoned it silently. Say explicitly which approach wins and why the other loses."
   fi
+  if [ "$(identical_production)" = "yes" ]; then
+    block+="${block:+ }MECHANICAL NOTE: the production code of every candidate is identical (only tests, docs or translations differ). Say so first in your verdict: the ranking can only reflect tests, evidence and reporting, not which implementation is better."
+  fi
   msg="${msg//\{\{APPROACHES\}\}/$block}"
   out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.judge = $j | .status = "judged"'; printf '%s\n' "$out"
 }
 
 cmd_promote() {
   mf_require "${1:-}"; shift || true
-  local l="${1:-}"; [ -n "$l" ] || die "usage: promote <slug> <label> [--branch name] [--env]"; shift; guard_label "$l"
-  local target="feature/$SLUG" env=0
-  while [ $# -gt 0 ]; do case "$1" in --branch) target="${2:?}"; shift 2 ;; --env) env=1; shift ;; *) die "unknown option $1" ;; esac; done
+  local l="${1:-}"; [ -n "$l" ] || die "usage: promote <slug> <label> [--branch name] [--env] [--allow-undeclared]"; shift; guard_label "$l"
+  local target="feature/$SLUG" env=0 allow=0
+  while [ $# -gt 0 ]; do case "$1" in --branch) target="${2:?}"; shift 2 ;; --env) env=1; shift ;; --allow-undeclared) allow=1; shift ;; *) die "unknown option $1" ;; esac; done
   local src wt; src="$(cand_get "$l" '.branch')"; wt="$(cand_get "$l" '.env_dir')/$REPO_REL"
   git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$src" || die "branch $src does not exist"
   git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$target" && die "branch $target already exists"
   # Candidates never commit: record their working tree on the tmp branch so the
   # promoted branch carries the work (this is the only commit the tool ever makes).
   if [ -d "$wt" ] && [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    # `add -A` takes everything in the tree, so nothing the winner did not declare may be there.
+    if [ "$allow" = "0" ]; then
+      local changed declared extra report; report="$(cand_get "$l" '.env_dir')/arena-report.md"
+      changed="$(mktemp)"; declared="$(mktemp)"
+      changed_files "$wt" > "$changed"; if [ -f "$report" ]; then report_files "$report" > "$declared"; fi
+      extra="$(undeclared_files "$changed" "$declared")"; rm -f "$changed" "$declared"
+      [ -z "$extra" ] || die "files in $wt that the report does not declare (remove them, or repeat with --allow-undeclared):"$'\n'"$extra"
+    fi
     git -C "$wt" add -A
     git -C "$wt" -c user.name="ai-arena" -c user.email="ai-arena@localhost" commit -q -m "arena $SLUG: candidate $l (work in progress, review before merging)"
     log "recorded candidate $l's working tree on $src"
@@ -705,6 +848,17 @@ cmd_clean() {
     [ "$(cand_get "$l" '.state')" = "running" ] && { warn "candidate $l is still running; skipping"; continue; }
     remove_candidate_env "$l" "$keep_branch"; cand_set "$l" state cleaned
   done
+  # The promoted branch holds the winner's commits, so its tmp/ branch is only a leftover.
+  local src target; target="$(mf_get '.winner.branch // empty')"
+  if [ -n "$winner" ] && [ "$winner" != "$keep" ] && [ -n "$target" ]; then
+    src="$(cand_get "$winner" '.branch')"
+    case "$src" in tmp/*)
+      if git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$src" && git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$target" \
+        && git -C "$REPO_DIR" merge-base --is-ancestor "$src" "$target"; then
+        git -C "$REPO_DIR" branch -D "$src" >/dev/null && log "deleted branch $src (contained in $target)"
+      fi ;;
+    esac
+  fi
   mf_update '.status = "cleaned"'
   [ "$purge" = "1" ] && { rm -rf "$ARENA_DIR"; log "purged $ARENA_DIR"; }
   return 0
@@ -759,6 +913,7 @@ cmd_review() {
     [ -n "$intent" ] || intent="Patch $(basename "$patch")"
   fi
   [ -s "$dir/diff.patch" ] || die "empty diff: nothing to review"
+  if [ -n "$env" ]; then changed_files "$env/$REPO_REL" > "$dir/tree-before.txt"; fi
   printf '%s\n' "$intent" > "$dir/intent.txt"
   log "review $id: $(grep -c '^diff --git' "$dir/diff.patch") file(s) in the diff"
   # Fan out the reviewers (labels r1, r2, ...) in parallel, each blind to the others.
@@ -802,6 +957,14 @@ cmd_review() {
   log "lead synthesis ($harness${model:+ $model}) ..."
   docker exec -u "$user" -w "$CONTAINER_ROOT" "$container" bash -c "$cmd" < /dev/null > "$out" 2> "$logf" || warn "lead call exited non-zero; see $logf"
   [ -s "$dir/verdict.md" ] || result_text "$harness" "$out" > "$dir/verdict.md" 2>/dev/null || true
+  if [ -n "$env" ]; then
+    # Reviewers read the tree, they must not write in it: anything new here would reach the branch.
+    changed_files "$env/$REPO_REL" > "$dir/tree-after.txt"
+    if [ -n "$(undeclared_files "$dir/tree-after.txt" "$dir/tree-before.txt")" ]; then
+      warn "the review left files in $env/$REPO_REL (remove them before promoting):"
+      undeclared_files "$dir/tree-after.txt" "$dir/tree-before.txt" >&2
+    fi
+  fi
   echo "review: $dir"
   echo "reviewers: $(jq -r '[.label + "=" + .harness + ":" + (.model // "default")] | join(" ")' "$dir/reviewers.jsonl" | tr '\n' ' ')"
   echo "---"
@@ -820,6 +983,6 @@ resolve_project
 case "$cmd" in
   doctor) cmd_doctor ;; up) cmd_up ;; init) cmd_init "$@" ;; plan) cmd_plan "$@" ;; spawn) cmd_spawn "$@" ;; run) cmd_run "$@" ;;
   wait) cmd_wait "$@" ;; stop) cmd_stop "$@" ;; status) cmd_status "$@" ;; resume) cmd_resume "$@" ;; pm) cmd_pm "$@" ;; gate) cmd_gate "$@" ;;
-  collect) cmd_collect "$@" ;; judge) cmd_judge "$@" ;; promote) cmd_promote "$@" ;; reveal) cmd_reveal "$@" ;; clean) cmd_clean "$@" ;; list) cmd_list ;; review) cmd_review "$@" ;;
+  collect) cmd_collect "$@" ;; compare) cmd_compare "$@" ;; judge) cmd_judge "$@" ;; promote) cmd_promote "$@" ;; reveal) cmd_reveal "$@" ;; clean) cmd_clean "$@" ;; list) cmd_list ;; review) cmd_review "$@" ;;
   *) die "unknown command '$cmd' (see ai-arena --help)" ;;
 esac

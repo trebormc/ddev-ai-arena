@@ -23,6 +23,6 @@ ASSUMED: <inferences you made, labeled, or "none">
 QUESTION: <for BLOCKED only: the exact question, and what you would do under each answer>
 NOT DONE: <for PARTIAL/FAILED: what remains and why>
 
-Before writing the report run `git status --short` in the repository and make FILES match it exactly (every changed or new path listed, nothing listed that does not exist); the host checks this mechanically (report gate) and a mismatch fails the gate. RUBRIC answers must come from your own diff and output, never from what another agent said it did.
+Make FILES match your working tree exactly: every changed or new path listed, nothing listed that does not exist, and no scratch file left in the repository (keep those under /tmp). The host checks this both ways (report gate) and a mismatch fails the gate; promote refuses undeclared files. Try `git status --short` in the repository, but `git` can fail in this container because the worktree points at a host path: do not try to repair it, list the paths from your own edits instead and say so in DEVIATIONS. RUBRIC answers must come from your own diff and output, never from what another agent said it did.
 
 Your last message is read by a script, not a person: after writing the report, reply with one line: `REPORT WRITTEN: <STATUS>`.

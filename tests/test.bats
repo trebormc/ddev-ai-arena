@@ -86,7 +86,7 @@ cli_env() {
 
 @test "all scripts have valid bash syntax" {
   set -eu -o pipefail
-  for f in "$DIR/install.sh" "$SCRIPTS/ai-arena" "$SCRIPTS/lib.sh" "$SCRIPTS/worktree-add" "$SCRIPTS/worktree-remove"; do
+  for f in "$DIR/install.sh" "$SCRIPTS/ai-arena" "$SCRIPTS/lib.sh" "$SCRIPTS/worktree-add" "$SCRIPTS/worktree-remove" "$SCRIPTS/host-skills-sync"; do
     run bash -n "$f"
     assert_success
   done
@@ -98,7 +98,7 @@ cli_env() {
   run head -n 2 "$DIR/skills/ai-arena/SKILL.md"
   assert_line --index 0 "---"
   assert_line --index 1 "name: ai-arena"
-  for s in ai-arena worktree-add worktree-remove; do
+  for s in ai-arena worktree-add worktree-remove host-skills-sync; do
     assert [ -x "$SCRIPTS/$s" ]
   done
   # Every prompt template referenced by the CLI must exist.
@@ -136,13 +136,13 @@ cli_env() {
   for dest in "$HOME/.claude/skills/ai-arena" "$HOME/.config/opencode/skills/ai-arena"; do
     assert [ -f "$dest/SKILL.md" ]
     assert [ -f "$dest/prompts/candidate.md" ]
-    for s in ai-arena worktree-add worktree-remove; do
+    for s in ai-arena worktree-add worktree-remove host-skills-sync; do
       assert [ -x "$dest/scripts/$s" ]
     done
   done
 
   # The CLI links point at the first installed copy (Claude Code's).
-  for s in ai-arena worktree-add worktree-remove; do
+  for s in ai-arena worktree-add worktree-remove host-skills-sync; do
     assert [ -L "$HOME/.local/bin/$s" ]
     run readlink "$HOME/.local/bin/$s"
     assert_output "$HOME/.claude/skills/ai-arena/scripts/$s"
@@ -475,4 +475,356 @@ EOF
   assert_success
   assert [ "${#output}" -le 32 ]
   assert_output --regexp '^[a-z0-9]+(-[a-z0-9]+)*$'
+}
+
+# ---------------------------------------------------------------------------
+# Rounds, usage and comparison
+# ---------------------------------------------------------------------------
+
+@test "cli: run_usage reads Claude Code output, subagents included" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions run_usage)"
+  cat > "$TESTDIR/run.json" <<'EOF'
+{"num_turns":47,"total_cost_usd":4.12,"usage":{"input_tokens":1,"output_tokens":2},
+ "modelUsage":{"opus":{"inputTokens":60,"outputTokens":50,"cacheReadInputTokens":100,"cacheCreationInputTokens":10},
+               "haiku":{"inputTokens":40,"outputTokens":50,"cacheReadInputTokens":100,"cacheCreationInputTokens":10}}}
+EOF
+  run run_usage claude "$TESTDIR/run.json"
+  assert_success
+  assert_output '{"steps":47,"input":100,"output":100,"cache_read":200,"cache_write":20,"cost_usd":4.12}'
+}
+
+@test "cli: run_usage reads OpenCode events, counts reasoning as output and keeps cost 0" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions run_usage)"
+  cat > "$TESTDIR/run.json" <<'EOF'
+{"type":"step_start","part":{}}
+{"type":"text","part":{"text":"hi"}}
+{"type":"step_finish","part":{"cost":0,"tokens":{"input":10,"output":1,"reasoning":2,"cache":{"read":100,"write":0}}}}
+{"type":"step_finish","part":{"cost":0,"tokens":{"input":20,"output":3,"reasoning":4,"cache":{"read":200,"write":0}}}}
+EOF
+  run run_usage opencode "$TESTDIR/run.json"
+  assert_success
+  assert_output '{"steps":2,"input":30,"output":10,"cache_read":300,"cache_write":0,"cost_usd":0}'
+}
+
+@test "cli: run_usage prints null when the run left nothing" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions run_usage)"
+  : > "$TESTDIR/empty.json"
+  run run_usage opencode "$TESTDIR/empty.json"
+  assert_output "null"
+}
+
+# Loads the manifest helpers against a one-candidate manifest in $ARENA_DIR.
+arena_fixture() { # harness
+  cli_env
+  eval "$(cli_functions mf_get mf_update cand_get cand_set cand_set_json labels run_usage record_round now)"
+  export ARENA_DIR="$TESTDIR/arena/x" MANIFEST="$TESTDIR/arena/x/manifest.json" ENV_DIR="$TESTDIR/env"
+  mkdir -p "$ARENA_DIR" "$ENV_DIR"
+  jq -n --arg d "$ENV_DIR" --arg h "$1" '{candidates:[{label:"a", harness:$h, env_dir:$d, started:"2026-11-04T13:24:26Z", cost_usd:null, duration_s:null}]}' > "$MANIFEST"
+}
+
+@test "cli: record_round adds up rounds and ends at the exit file, not at the settle time" {
+  set -eu -o pipefail
+  arena_fixture opencode
+  printf '%s\n' '{"type":"step_finish","part":{"cost":0,"tokens":{"input":5,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}}' > "$ENV_DIR/arena-run.json"
+  echo 1 > "$ENV_DIR/arena-run.exit"
+  touch -d "2026-11-04T13:45:26Z" "$ENV_DIR/arena-run.exit"
+  record_round a opencode 1 DONE
+
+  cand_set a started "2026-11-04T14:07:00Z"
+  touch -d "2026-11-04T14:34:00Z" "$ENV_DIR/arena-run.exit"
+  record_round a opencode 0 DONE
+
+  run jq -c '.candidates[0] | {duration_s, cost_usd, n:(.rounds | length), first:.rounds[0].duration_s, second:.rounds[1].duration_s, code:.rounds[0].exit_code, end:.finished}' "$MANIFEST"
+  assert_output '{"duration_s":2880,"cost_usd":0,"n":2,"first":1260,"second":1620,"code":"1","end":"2026-11-04T14:34:00Z"}'
+  # The raw output of every round survives a later resume.
+  assert [ -f "$ARENA_DIR/rounds/a-1.json" ]
+  assert [ -f "$ARENA_DIR/rounds/a-2.json" ]
+}
+
+@test "cli: cost_usd stays null when no round reports a cost" {
+  set -eu -o pipefail
+  arena_fixture claude
+  : > "$ENV_DIR/arena-run.json"
+  echo 0 > "$ENV_DIR/arena-run.exit"
+  record_round a claude 0 DONE
+  run jq -c '.candidates[0].cost_usd' "$MANIFEST"
+  assert_output "null"
+}
+
+@test "cli: report_files parses FILES and undeclared_files finds what the report omits" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions report_files undeclared_files)"
+  REPO_REL=app
+  cat > "$TESTDIR/report.md" <<'EOF'
+STATUS: DONE
+SUMMARY: done
+FILES:
+- web/modules/custom/x/x.module
+app/web/modules/custom/x/README.md
+EVIDENCE: output
+EOF
+  report_files "$TESTDIR/report.md" > "$TESTDIR/declared.txt"
+  run cat "$TESTDIR/declared.txt"
+  assert_line --index 0 "web/modules/custom/x/x.module"
+  assert_line --index 1 "web/modules/custom/x/README.md"
+
+  printf 'web/modules/custom/x/x.module\nweb/tmp/lead-review.sqlite\n' > "$TESTDIR/changed.txt"
+  run undeclared_files "$TESTDIR/changed.txt" "$TESTDIR/declared.txt"
+  assert_success
+  assert_output "web/tmp/lead-review.sqlite"
+
+  : > "$TESTDIR/none.txt"
+  run undeclared_files "$TESTDIR/declared.txt" "$TESTDIR/declared.txt"
+  assert_output ""
+}
+
+patch_for() { # file body
+  printf 'diff --git a/%s b/%s\nindex abc..def 100644\n+%s\n' "$1" "$1" "$2"
+}
+
+@test "cli: identical_production ignores tests, docs and translations but not code" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions production_hash identical_production)"
+  export ARENA_DIR="$TESTDIR/arena"
+  mkdir -p "$ARENA_DIR/candidates/a" "$ARENA_DIR/candidates/b"
+  { patch_for src/A.php code; patch_for tests/src/Kernel/ATest.php one; patch_for README.md one; } > "$ARENA_DIR/candidates/a/diff.patch"
+  { patch_for src/A.php code; patch_for tests/src/Kernel/ATest.php two; patch_for translations/x.es.po two; } > "$ARENA_DIR/candidates/b/diff.patch"
+  run identical_production
+  assert_output "yes"
+
+  patch_for src/A.php other > "$ARENA_DIR/candidates/b/diff.patch"
+  run identical_production
+  assert_output ""
+
+  # Only tests changed: nothing to compare, so no claim either way.
+  patch_for tests/src/Kernel/ATest.php one > "$ARENA_DIR/candidates/a/diff.patch"
+  patch_for tests/src/Kernel/ATest.php one > "$ARENA_DIR/candidates/b/diff.patch"
+  run identical_production
+  assert_output ""
+}
+
+@test "cli: phpunit_totals sums both PHPUnit summary formats" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions phpunit_totals)"
+  mkdir -p "$TESTDIR/g"
+  run phpunit_totals "$TESTDIR/g"
+  assert_output "null"
+  printf 'OK (3 tests, 9 assertions)\n' > "$TESTDIR/g/phpunit-a.log"
+  printf 'FAILURES!\nTests: 5, Assertions: 7, Failures: 1, Errors: 2, Deprecations: 3.\n' > "$TESTDIR/g/phpunit-b.log"
+  run phpunit_totals "$TESTDIR/g"
+  assert_output '{"tests":8,"assertions":16,"failures":1,"errors":2}'
+}
+
+# A coordinator with a real repository, a winner branch and its candidate tree.
+git_arena() {
+  stub_tools
+  COORD_DIR="$TESTDIR/coord"
+  mkdir -p "$COORD_DIR/.ddev" "$COORD_DIR/main/.ddev" "$COORD_DIR/arena/x/candidates/a" "$COORD_DIR/worktree-tmp"
+  printf 'name: base-arena\ntype: generic\n' > "$COORD_DIR/.ddev/config.yaml"
+  printf 'name: base\ntype: drupal\n' > "$COORD_DIR/main/.ddev/config.yaml"
+  REPO="$COORD_DIR/main/app"; WT="$COORD_DIR/worktree-tmp/base-tmp-x-a/app"
+  git init -q -b main "$REPO"
+  git -C "$REPO" config user.name t; git -C "$REPO" config user.email t@t
+  echo base > "$REPO/file.txt"; git -C "$REPO" add -A; git -C "$REPO" commit -q -m base
+  mkdir -p "$(dirname "$WT")"
+  git -C "$REPO" worktree add -q -b tmp/x-a "$WT"
+  jq -n --arg d "$(dirname "$WT")" '{slug:"x", status:"judged", mode:"models", pm:{harness:"claude"}, candidates:[{label:"a", harness:"claude", branch:"tmp/x-a", env_dir:$d, env_name:"base-tmp-x-a", state:"DONE"}], judge:{winner:"a"}, winner:null}' > "$COORD_DIR/arena/x/manifest.json"
+  export HOME_GIT=1
+}
+
+write_report() { printf 'STATUS: DONE\nFILES:\n%s\nEVIDENCE: x\n' "$1" > "$(dirname "$WT")/arena-report.md"; }
+
+@test "promote refuses files the report does not declare and --allow-undeclared overrides it" {
+  set -eu -o pipefail
+  git_arena
+  echo changed > "$WT/file.txt"; echo junk > "$WT/stray.sqlite"
+  write_report file.txt
+
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" promote x a
+  assert_failure
+  assert_output --partial "stray.sqlite"
+  run git -C "$REPO" branch --list feature/x
+  assert_output ""
+  run git -C "$WT" log --oneline
+  assert_line --index 0 --partial "base"
+
+  rm "$WT/stray.sqlite"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" promote x a
+  assert_success
+  run git -C "$REPO" branch --list feature/x
+  assert_output --partial "feature/x"
+
+  run git -C "$REPO" branch -D feature/x
+  git -C "$WT" reset -q --hard HEAD~1
+  echo changed > "$WT/file.txt"; echo junk > "$WT/stray.sqlite"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" promote x a --allow-undeclared
+  assert_success
+  run git -C "$REPO" show --name-only --format= feature/x
+  assert_output --partial "stray.sqlite"
+}
+
+@test "clean deletes the winner's tmp branch once the promoted branch contains it" {
+  set -eu -o pipefail
+  git_arena
+  echo changed > "$WT/file.txt"
+  write_report file.txt
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" promote x a
+  assert_success
+  git -C "$REPO" worktree remove --force "$WT"
+  rm -rf "$(dirname "$WT")"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" clean x
+  assert_success
+  run git -C "$REPO" branch --list 'tmp/*'
+  assert_output ""
+  run git -C "$REPO" branch --list feature/x
+  assert_output --partial "feature/x"
+}
+
+@test "ai-arena compare prints rounds, totals, tests and failed gates by label" {
+  set -eu -o pipefail
+  stub_tools
+  local coord; coord="$(make_coordinator base-arena base app)"
+  mkdir -p "$coord/arena/x/candidates/a/gates" "$coord/arena/x/candidates/b/gates"
+  printf 'OK (11 tests, 40 assertions)\n' > "$coord/arena/x/candidates/a/gates/phpunit-m.log"
+  patch_for src/A.php same > "$coord/arena/x/candidates/a/diff.patch"
+  patch_for src/A.php same > "$coord/arena/x/candidates/b/diff.patch"
+  cat > "$coord/arena/x/manifest.json" <<'EOF'
+{"slug":"x","status":"collected","candidates":[
+ {"label":"a","state":"DONE","cost_usd":4.125,"duration_s":1292,"gates":{"site":"pass","phpunit":"pass"},
+  "rounds":[{"round":1,"duration_s":1292,"steps":47,"input":100,"output":50,"cache_read":0,"cache_write":0,"cost_usd":4.125}]},
+ {"label":"b","state":"DONE","cost_usd":0,"duration_s":2880,"gates":{"site":"pass","phpunit":"fail"},
+  "rounds":[{"round":1,"duration_s":1260,"steps":110,"input":10,"output":1,"cache_read":0,"cache_write":0,"cost_usd":0},
+            {"round":2,"duration_s":1620,"steps":114,"input":20,"output":2,"cache_read":0,"cache_write":0,"cost_usd":0}]}]}
+EOF
+  run "$SCRIPTS/ai-arena" --project "$coord" compare x
+  assert_success
+  assert_output --partial "note: every candidate delivered the same production code"
+  assert_output --regexp "a +1 +0 h 22 min +47 +150 +\\\$4\.13"
+  assert_output --regexp "b +2 +0 h 27 min +114 +22 +\\\$0"
+  assert_output --regexp "b +total +0 h 48 min +224 +33 +\\\$0"
+  assert_output --partial "a: 11 tests, 0 failures, 0 errors; gates: all pass"
+  assert_output --partial "b: no test run; gates: failed phpunit"
+
+  run "$SCRIPTS/ai-arena" --project "$coord" compare x --json
+  assert_success
+  run bash -c "printf '%s' '$output' | jq -r '.identical_production_code'"
+  assert_output "true"
+}
+
+@test "worktree-remove without a terminal fails loudly and removes nothing" {
+  set -eu -o pipefail
+  stub_tools
+  local coord; coord="$(make_coordinator base-arena base app)"
+  git init -q -b main "$coord/main/app.real"
+  rm -rf "$coord/main/app"; mv "$coord/main/app.real" "$coord/main/app"
+  mkdir -p "$coord/worktree/base-feature-x/.ddev" "$coord/worktree/base-feature-x/app"
+  printf 'name: base-feature-x\n' > "$coord/worktree/base-feature-x/.ddev/config.yaml"
+  run bash -c "'$SCRIPTS/worktree-remove' --project '$coord' '$coord/worktree/base-feature-x' < /dev/null"
+  assert_failure
+  assert_output --partial "nothing was removed"
+  assert [ -d "$coord/worktree/base-feature-x" ]
+}
+
+# ---------------------------------------------------------------------------
+# host-skills-sync
+# ---------------------------------------------------------------------------
+
+make_skill() { # repo name
+  mkdir -p "$1/.claude/skills/$2"
+  printf -- '---\nname: %s\n---\n' "$2" > "$1/.claude/skills/$2/SKILL.md"
+}
+
+@test "host-skills-sync links repo skills, later repos win, foreign directories stay" {
+  set -eu -o pipefail
+  mkdir -p "$HOME/.ddev/ai-arena" "$HOME/.claude/skills/mine" "$HOME/.config/opencode"
+  make_skill "$TESTDIR/one" dreaming
+  make_skill "$TESTDIR/one" shared
+  make_skill "$TESTDIR/one" mine
+  make_skill "$TESTDIR/one" ai-arena
+  make_skill "$TESTDIR/two" shared
+  echo "AI_ARENA_HOST_SKILL_REPOS=$TESTDIR/one,$TESTDIR/two" > "$HOME/.ddev/ai-arena/config.env"
+
+  run "$SCRIPTS/host-skills-sync"
+  assert_success
+  assert_output --partial "exists and is not a link"
+  assert_output --partial "ai-arena is installed by install.sh"
+  assert [ -f "$HOME/.claude/skills/dreaming/SKILL.md" ]
+  assert [ -f "$HOME/.config/opencode/skills/dreaming/SKILL.md" ]
+  run readlink "$HOME/.claude/skills/shared"
+  assert_output "$TESTDIR/two/.claude/skills/shared"
+  assert [ ! -L "$HOME/.claude/skills/mine" ]
+  assert [ ! -e "$HOME/.claude/skills/ai-arena" ]
+
+  run "$SCRIPTS/host-skills-sync" --list
+  assert_output --partial "dreaming"
+}
+
+@test "host-skills-sync unlinks skills that disappear and is a no-op when unconfigured" {
+  set -eu -o pipefail
+  mkdir -p "$HOME/.ddev/ai-arena" "$HOME/.claude"
+  make_skill "$TESTDIR/one" dreaming
+  echo "AI_ARENA_HOST_SKILL_REPOS=$TESTDIR/one" > "$HOME/.ddev/ai-arena/config.env"
+  "$SCRIPTS/host-skills-sync"
+  assert [ -L "$HOME/.claude/skills/dreaming" ]
+
+  rm -rf "$TESTDIR/one/.claude/skills/dreaming"
+  run "$SCRIPTS/host-skills-sync"
+  assert_success
+  assert [ ! -L "$HOME/.claude/skills/dreaming" ]
+
+  rm "$HOME/.ddev/ai-arena/config.env"
+  run "$SCRIPTS/host-skills-sync"
+  assert_success
+}
+
+@test "install.sh links host-skills-sync and runs it" {
+  set -eu -o pipefail
+  mkdir -p "$HOME/.ddev/ai-arena" "$HOME/.config/opencode"
+  make_skill "$TESTDIR/one" dreaming
+  echo "AI_ARENA_HOST_SKILL_REPOS=$TESTDIR/one" > "$HOME/.ddev/ai-arena/config.env"
+  run "$DIR/install.sh"
+  assert_success
+  assert [ -L "$HOME/.local/bin/host-skills-sync" ]
+  assert [ -L "$HOME/.claude/skills/dreaming" ]
+}
+
+@test "the report gate fails on a changed file the report does not list, and on a listed file that is missing" {
+  set -eu -o pipefail
+  git_arena
+  echo changed > "$WT/file.txt"; echo junk > "$WT/stray.sqlite"
+  write_report file.txt
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
+  assert_success
+  run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
+  assert_output "fail"
+  run cat "$COORD_DIR/arena/x/candidates/a/gates/report.log"
+  assert_output --partial "changed in the tree but not in FILES: stray.sqlite"
+
+  rm "$WT/stray.sqlite"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
+  run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
+  assert_output "pass"
+
+  write_report "$(printf 'file.txt\nghost.txt')"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
+  run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
+  assert_output "fail"
+  run cat "$COORD_DIR/arena/x/candidates/a/gates/report.log"
+  assert_output --partial "listed in FILES but absent from the tree: ghost.txt"
+
+  # A deleted file is a change the report may list.
+  rm "$WT/file.txt"
+  write_report file.txt
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
+  run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
+  assert_output "pass"
 }
