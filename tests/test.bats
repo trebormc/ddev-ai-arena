@@ -828,3 +828,39 @@ make_skill() { # repo name
   run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
   assert_output "pass"
 }
+
+@test "worktree-remove refuses uncommitted changes before touching DDEV, -f still removes" {
+  set -eu -o pipefail
+  git_arena
+  printf '#!/usr/bin/env bash\necho "$*" >> "%s/ddev.log"\nexit 0\n' "$TESTDIR" > "$TESTDIR/bin/ddev"
+  : > "$TESTDIR/ddev.log"
+  local env; env="$(dirname "$WT")"
+  mkdir -p "$env/.ddev"
+  printf 'name: base-tmp-x-a\n' > "$env/.ddev/config.yaml"
+  echo changed > "$WT/file.txt"
+
+  run "$SCRIPTS/worktree-remove" --project "$COORD_DIR" -y "$env"
+  assert_failure
+  assert_output --partial "uncommitted changes"
+  assert_output --partial "nothing was removed"
+  assert [ -f "$WT/file.txt" ]
+  run grep -c "delete" "$TESTDIR/ddev.log"
+  assert_output "0"
+
+  run "$SCRIPTS/worktree-remove" --project "$COORD_DIR" -y -f "$env"
+  assert_success
+  assert [ ! -d "$env" ]
+  run grep -c "delete" "$TESTDIR/ddev.log"
+  assert_output "1"
+}
+
+@test "worktree-remove removes a clean worktree without -f" {
+  set -eu -o pipefail
+  git_arena
+  local env; env="$(dirname "$WT")"
+  mkdir -p "$env/.ddev"
+  printf 'name: base-tmp-x-a\n' > "$env/.ddev/config.yaml"
+  run "$SCRIPTS/worktree-remove" --project "$COORD_DIR" -y "$env"
+  assert_success
+  assert [ ! -d "$env" ]
+}

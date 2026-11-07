@@ -7,7 +7,8 @@
 #   --tmp-only        refuse anything outside <project>/worktree-tmp/
 #   --keep-branch     do not delete the git branch
 #   -y                no confirmation prompt
-#   -f                force: remove a worktree with uncommitted changes and delete
+#   -f                force: remove a worktree with uncommitted changes (refused
+#                     otherwise, before anything is deleted) and delete
 #                     the branch even when it has unmerged commits
 set -euo pipefail
 
@@ -58,6 +59,11 @@ env_name="$(ddev_name "$dest")"
 wt_repo="$dest/$REPO_REL"
 branch=""
 [ -e "$wt_repo/.git" ] && branch="$(git -C "$wt_repo" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+
+# Check before anything is deleted: git only refuses later, after DDEV has lost the database.
+if [ "$force" = "0" ] && [ -e "$wt_repo/.git" ] && [ -n "$(git -C "$wt_repo" status --porcelain 2>/dev/null)" ]; then
+  die "uncommitted changes in $wt_repo: nothing was removed (review them, or repeat with -f)"
+fi
 
 echo "About to remove environment '$env_name':" >&2
 echo "  - DDEV project '$env_name' (containers and database)" >&2
