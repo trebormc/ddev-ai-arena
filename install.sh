@@ -83,6 +83,9 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 # Reviewer panel for `ai-arena review`: comma-separated "harness[:model]".
 #AI_ARENA_REVIEWERS=claude:opus,opencode
 
+# Who plans a new arena: pm (one shared plan) or candidates (one plan each, then merged).
+#AI_ARENA_PLAN_BY=pm
+
 # Repository a candidate's short "@<branch>" agents pin refers to.
 #AI_ARENA_AGENTS_REPO=https://github.com/trebormc/drupal-ai-agents.git
 

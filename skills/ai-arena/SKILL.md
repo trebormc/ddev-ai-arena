@@ -48,6 +48,24 @@ Everything mechanical is a verb of `ai-arena`; everything that needs Drupal judg
 happens inside AI containers through `plan`, `pm`, and `judge`. You decide which verb
 comes next and read JSON. `ai-arena status <slug> --json` is the source of truth.
 
+## Planning in the candidates
+
+When the user asks for each harness to plan, or for phases ("que planifique cada arnés",
+"fase de planificación"), add `--plan-by candidates` to `init`. Steps 3 to 5 become:
+
+- `ai-arena spawn <slug>`, then `ai-arena draft <slug>` and the wait loop of step 6. Each
+  candidate writes a plan and changes nothing. A `BLOCKED` planner has no PM behind it yet:
+  put its question to the user and `resume` it.
+- `ai-arena merge <slug>`, in the background. The PM picks one plan blind, improves it with
+  the others and writes the brief. Read the brief as in step 3; `ASK_USER` works the same.
+- `ai-arena run <slug>`: the candidates continue their sessions on the merged brief.
+
+Steps 6 to 8 stay. `judge` also writes `arena/<slug>/grafts.md`, so step 9 changes order:
+`ai-arena promote <slug> <winner> --env`, then `ai-arena graft <slug>` in the background (it
+blocks, then gates the environment under `worktree/`), then `ai-arena review --env
+<that environment>`; send Act-on items with `ai-arena graft <slug> --message "..."`.
+Nothing there is committed: the user reviews and commits it.
+
 ## The run
 
 1. **Bring up layer 2.** `ai-arena doctor`, then `ai-arena up` if the coordinator's

@@ -38,6 +38,7 @@ AI_ARENA_DB="auto"
 AI_ARENA_LOCAL_FILES=""
 AI_ARENA_MAIN_ENV=""
 AI_ARENA_REVIEWERS="claude:opus,opencode"
+AI_ARENA_PLAN_BY="pm"
 AI_ARENA_AGENTS_REPO="https://github.com/trebormc/drupal-ai-agents.git"
 
 log()  { printf '==> %s\n' "$*" >&2; }
@@ -58,7 +59,7 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   doctor                                   Check host tools, layout, coordinator containers
   up                                       Start the coordinator project's containers
   init "<task>" [--candidates a,b] [--pm harness[:model]] [--description "..."]
-       [--approaches | --approach "..." ...]
+       [--approaches | --approach "..." ...] [--plan-by pm|candidates]
                                            Create arena/<slug>/manifest.json. A candidate is
                                            harness[:model][@agents] where @agents pins the agents
                                            repo (a branch of the default repo, or url#ref) to
@@ -69,6 +70,9 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
                                            (one per label, in order) dictates them; --approaches
                                            lets the PM propose them in `plan` for your confirmation
   plan <slug> ["description"]              PM session writes arena/<slug>/brief.md
+  draft <slug> [label...]                  --plan-by candidates: each candidate writes its own plan
+  merge <slug>                             --plan-by candidates: PM picks the best plan, improves it
+                                           with the others and writes arena/<slug>/brief.md
   spawn <slug> [label...]                  Create candidate environments (worktree-add --tmp)
   run <slug> [label...]                    Start candidates (detached) on the brief
   wait <slug> [--all] [--timeout S] [--interval S]
@@ -87,6 +91,8 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   promote <slug> <label> [--branch name] [--env] [--allow-undeclared]
                                            feature/<slug> from the winner (optionally its environment);
                                            refuses files the winner's report does not declare
+  graft <slug> [--message "..."]           Port the judge's grafts into the promoted environment
+                                           (promote --env first) and gate the result
   reveal <slug>                            Label -> harness/model, log the win
   clean <slug> [--keep label] [--purge]    Delete candidate environments and tmp/ branches (the winner's
                                            tmp/ branch too, once the promoted branch contains it)
@@ -134,6 +140,7 @@ mf_require() {
 # Approaches mode: arena/<slug>/approach-<label>.md holds the approach assigned to a
 # label (first line = title). The manifest carries .mode and .candidates[].approach (title).
 arena_mode() { mf_get '.mode // "models"'; }
+arena_plan_by() { mf_get '.plan_by // "pm"'; }
 approach_file() { printf '%s/approach-%s.md' "$ARENA_DIR" "$1"; }
 approach_title() { # file -> first non-empty line, without heading marks, <= 70 chars
   [ -s "$1" ] || return 0
@@ -160,7 +167,9 @@ mf_update() {
     jq "$@" "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
   ) 9> "$MANIFEST.lock"
 }
-cand_get() { jq -r --arg l "$1" ".candidates[] | select(.label==\$l) | $2" "$MANIFEST"; }
+# "final" is the graft run in the promoted environment: readable like a candidate, but not a label,
+# so judge, reveal and clean never touch it.
+cand_get() { jq -r --arg l "$1" "(.candidates + [.final // empty])[] | select(.label==\$l) | $2" "$MANIFEST"; }
 cand_set() { mf_update --arg l "$1" --arg k "$2" --arg v "$3" '(.candidates[] | select(.label==$l))[$k] = $v | .updated = (now | todate)'; }
 cand_set_json() { mf_update --arg l "$1" --arg k "$2" --argjson v "$3" '(.candidates[] | select(.label==$l))[$k] = $v'; }
 labels() { jq -r '.candidates[].label' "$MANIFEST"; }
@@ -545,10 +554,11 @@ cmd_up() { log "ddev start ($COORD)"; (cd "$PROJECT" && ddev start -y); }
 
 cmd_init() {
   local task="" candidates="$AI_ARENA_DEFAULT_CANDIDATES" pm="${AI_ARENA_PM_HARNESS}${AI_ARENA_PM_MODEL:+:$AI_ARENA_PM_MODEL}" description="" force=0
-  local mode="models" approach_texts=()
+  local mode="models" approach_texts=() plan_by="$AI_ARENA_PLAN_BY"
   while [ $# -gt 0 ]; do
     case "$1" in
       --candidates) candidates="$2"; shift 2 ;; --pm) pm="$2"; shift 2 ;; --description) description="$2"; shift 2 ;; --force) force=1; shift ;;
+      --plan-by) plan_by="${2:-}"; shift 2 ;;
       --approaches) mode="approaches"; shift ;;
       --approach) [ -n "${2:-}" ] || die "--approach needs a text"; approach_texts+=("$2"); mode="approaches"; shift 2 ;;
       -*) die "unknown option $1" ;; *) [ -z "$task" ] && task="$1" || description="$description $1"; shift ;;
@@ -556,6 +566,8 @@ cmd_init() {
   done
   [ -n "$task" ] || die "usage: init \"<task>\" [--candidates a,b] [--pm harness[:model]] [--description \"...\"] [--approaches | --approach \"...\" ...]"
   [ -n "$description" ] || description="$task"
+  case "$plan_by" in pm|candidates) ;; *) die "--plan-by must be pm or candidates" ;; esac
+  [ "$plan_by" = pm ] || [ "$mode" = models ] || die "--plan-by candidates does not combine with approaches: there each label already has its design"
   local slug dir; slug="$(slugify "$task")"; [ -n "$slug" ] || die "cannot derive a slug from '$task'"; dir="$(arena_dir "$slug")"
   [ -f "$dir/manifest.json" ] && [ "$force" = "0" ] && die "arena '$slug' exists (use --force to recreate the manifest)"
   mkdir -p "$dir/candidates" "$dir/pm"
@@ -578,8 +590,8 @@ cmd_init() {
   fi
   rm -f "$dir"/approach-*.md
   jq -n --arg slug "$slug" --arg task "$task" --arg description "$description" --arg created "$(now)" --arg ph "$pm_harness" --arg pm "$pm_model" \
-    --arg coord "$COORD" --arg project "$PROJECT" --arg main "$MAIN_ENV" --arg repo "$REPO_REL" --arg mode "$mode" --argjson c "$cands" \
-    '{slug:$slug, task:$task, description:$description, status:"init", mode:$mode, created:$created, coordinator:$coord, project:$project, main_env:$main, repo_rel:$repo,
+    --arg coord "$COORD" --arg project "$PROJECT" --arg main "$MAIN_ENV" --arg repo "$REPO_REL" --arg mode "$mode" --arg plan_by "$plan_by" --argjson c "$cands" \
+    '{slug:$slug, task:$task, description:$description, status:"init", mode:$mode, plan_by:$plan_by, created:$created, coordinator:$coord, project:$project, main_env:$main, repo_rel:$repo,
       pm:{harness:$ph, model:(if $pm=="" then null else $pm end), session:null}, candidates:($c | map(. + {approach:null})), judge:null, winner:null}' > "$dir/manifest.json"
   if [ ${#approach_texts[@]} -gt 0 ]; then
     local k=0 t
@@ -601,9 +613,15 @@ brief_lint() { # brief.md -> the lines candidates would trip on: lost ssh quotin
   grep -nE "ssh web drush (php:eval|ev|sqlq|sql:query) ['\"]|ssh web (ba)?sh -l?c|git (status|diff)|OK \([0-9]+ test" "$1" || true
 }
 
+check_brief() { # warn about commands the candidates would trip on
+  local hits; hits="$(brief_lint "$ARENA_DIR/brief.md")"
+  [ -z "$hits" ] || warn "brief.md carries commands that fail or mislead in the candidates' containers; have the PM rewrite them with 'ai-arena pm' before running them:"$'\n'"$hits"
+}
+
 cmd_plan() {
   mf_require "${1:-}"; shift || true
-  local description="${1:-$(mf_get '.description')}" msg block="" l hits
+  [ "$(arena_plan_by)" = pm ] || die "this arena plans in the candidates: ai-arena spawn, draft, wait --all, merge"
+  local description="${1:-$(mf_get '.description')}" msg block="" l
   msg="$(fill_prompt plan.md)"; msg="${msg//\{\{TASK\}\}/$description}"; msg="${msg//\{\{CANDIDATES\}\}/$(labels | tr '\n' ' ')}"
   if [ "$(arena_mode)" = approaches ]; then
     if ls "$ARENA_DIR"/approach-*.md >/dev/null 2>&1; then
@@ -627,9 +645,46 @@ cmd_plan() {
     for l in $(labels); do [ -s "$(approach_file "$l")" ] || warn "no approach for label $l yet ($(approach_file "$l")); settle it with 'ai-arena pm' before run"; done
     sync_approaches
   fi
-  hits="$(brief_lint "$ARENA_DIR/brief.md")"
-  [ -z "$hits" ] || warn "brief.md carries commands that fail or mislead in the candidates' containers; have the PM rewrite them with 'ai-arena pm' before spawn:"$'\n'"$hits"
+  check_brief
   mf_update '.status = "planned"'; log "brief written: $ARENA_DIR/brief.md"
+}
+
+cmd_draft() { # phase 1: every candidate investigates and writes its own plan
+  mf_require "${1:-}"; shift || true
+  [ "$(arena_plan_by)" = candidates ] || die "this arena is planned by the PM: ai-arena plan $SLUG"
+  local l env_dir prompt; prompt="$(sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/planner.md")"
+  for l in $(resolve_labels "$@"); do
+    guard_label "$l"
+    case "$(cand_get "$l" '.state')" in ready|BLOCKED|FAILED|PARTIAL) ;; running) warn "$l already running"; continue ;; *) warn "$l not ready"; continue ;; esac
+    env_dir="$(cand_get "$l" '.env_dir')"; rm -f "$env_dir/arena-plan.md"
+    printf '# Arena task: %s\n\n## Task\n%s\n\n%s\n' "$SLUG" "$(mf_get '.task')" "$(mf_get '.description')" > "$env_dir/arena-brief.md"
+    launch_candidate "$l" "$prompt" 0
+  done
+  mf_update '.status = "drafting"'
+}
+
+collect_plans() { # copy each finished plan under blind labels; prints the labels that have one
+  local l env_dir got=""; mkdir -p "$ARENA_DIR/plans"
+  for l in $(labels); do
+    env_dir="$(cand_get "$l" '.env_dir')"
+    if [ -s "$env_dir/arena-plan.md" ]; then cp "$env_dir/arena-plan.md" "$ARENA_DIR/plans/$l.md"; got+="$l "
+    else warn "candidate $l wrote no plan"; fi
+    [ -z "$(changed_files "$env_dir/$REPO_REL")" ] || warn "candidate $l changed files while planning; review its tree before it implements"
+  done
+  printf '%s' "$got"
+}
+
+cmd_merge() { # phase 1 ends: the PM turns the plans into the one brief everybody implements
+  mf_require "${1:-}"; shift || true
+  [ "$(arena_plan_by)" = candidates ] || die "this arena is planned by the PM: ai-arena plan $SLUG"
+  local got msg out l
+  for l in $(labels); do [ "$(cand_get "$l" '.state')" != running ] || die "candidate $l is still running (ai-arena wait $SLUG --all)"; done
+  got="$(collect_plans)"; [ -n "$got" ] || die "no plan to merge (ai-arena draft $SLUG)"
+  msg="$(fill_prompt merge.md)"; msg="${msg//\{\{TASK\}\}/$(mf_get '.description')}"; msg="${msg//\{\{PLANS\}\}/$CONTAINER_ARENA/plans/ ($got)}"
+  out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.plan_verdict = $j'
+  if [ -s "$ARENA_DIR/brief.md" ]; then check_brief; mf_update '.status = "planned"'; log "brief written: $ARENA_DIR/brief.md"
+  else warn "the PM wrote no brief yet; answer it with 'ai-arena pm' and ask it to write brief.md"; fi
+  printf '%s\n' "$out"
 }
 
 cmd_spawn() {
@@ -646,9 +701,9 @@ cmd_spawn() {
 
 cmd_run() {
   mf_require "${1:-}"; shift || true
-  [ -s "$ARENA_DIR/brief.md" ] || die "no brief (ai-arena plan $SLUG)"
+  [ -s "$ARENA_DIR/brief.md" ] || die "no brief (ai-arena $([ "$(arena_plan_by)" = pm ] && echo plan || echo merge) $SLUG)"
   # Inside a candidate's own container the repo sits at /var/www/html/<repo>, not at the coordinator path.
-  local l prompt env_dir note p; prompt="$(sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/candidate.md")"
+  local l prompt env_dir note p resume; prompt="$(sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/candidate.md")"
   if [ "$(arena_mode)" = approaches ]; then
     for l in $(resolve_labels "$@"); do [ -s "$(approach_file "$l")" ] || die "approaches mode but no approach for label $l ($(approach_file "$l")): run 'ai-arena plan' / 'ai-arena pm' first"; done
     sync_approaches
@@ -664,8 +719,13 @@ cmd_run() {
     else
       rm -f "$env_dir/arena-approach.md"
     fi
+    # A planner keeps its session: it already knows the code, and implementing needs no second investigation.
+    resume=0
+    if [ "$(arena_plan_by)" = candidates ] && [ -n "$(cand_get "$l" '.session // empty')" ]; then
+      resume=1; note="The project manager merged all the plans into /var/www/html/arena-brief.md. It replaces your plan: where they differ, the brief binds, whoever wrote the idea."
+    fi
     p="${prompt//\{\{APPROACH_NOTE\}\}/$note}"
-    launch_candidate "$l" "$p" 0
+    launch_candidate "$l" "$p" "$resume"
   done
   mf_update '.status = "running"'
 }
@@ -787,8 +847,48 @@ cmd_judge() {
   if [ "$(identical_production)" = "yes" ]; then
     block+="${block:+ }MECHANICAL NOTE: the production code of every candidate is identical (only tests, docs or translations differ). Say so first in your verdict: the ranking can only reflect tests, evidence and reporting, not which implementation is better."
   fi
+  if [ "$(arena_plan_by)" = candidates ]; then
+    block+="${block:+ }GRAFTS: besides the winner, write $CONTAINER_ARENA/grafts.md, the list a fresh agent will port into the winner: one item per concrete improvement, naming the source label, its file, what to port and why it beats the winner's version. Only what is clearly better; write the single word none if nothing is."
+  fi
   msg="${msg//\{\{APPROACHES\}\}/$block}"
   out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.judge = $j | .status = "judged"'; printf '%s\n' "$out"
+}
+
+grafts_empty() { # grafts.md -> success when it lists nothing to port
+  ! grep -qviE '^[[:space:]]*(none\.?)?[[:space:]]*$' "$1"
+}
+
+cmd_graft() { # last phase: the best parts of the losers, in the real environment of the winner
+  mf_require "${1:-}"; shift || true
+  local message=""
+  while [ $# -gt 0 ]; do case "$1" in --message) message="${2:?}"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  local winner env grafts; winner="$(mf_get '.winner.label // empty')"; env="$(mf_get '.winner.env_dir // empty')"; grafts="$ARENA_DIR/grafts.md"
+  { [ -n "$winner" ] && [ -n "$env" ] && [ -d "$env" ]; } || die "no promoted environment (ai-arena promote $SLUG <winner> --env)"
+  [ -f "$grafts" ] || die "no $grafts (the judge writes it in --plan-by candidates arenas; 'ai-arena pm' can ask for it)"
+  if [ -z "$message" ] && grafts_empty "$grafts"; then log "the judge listed nothing to graft"; return 0; fi
+  local harness model session="" name container user l pfile cmd status
+  harness="$(cand_get "$winner" '.harness')"; model="$(cand_get "$winner" '.model // empty')"; name="$(ddev_name "$env")"
+  user="$(harness_user "$harness")"; container="$(container_for "$harness" "$name")"
+  container_running "$container" || die "container $container is not running (cd $env && ddev start)"
+  mkdir -p "$env/arena-grafts"; cp "$grafts" "$env/arena-grafts/grafts.md"; cp "$ARENA_DIR/brief.md" "$env/arena-brief.md"
+  for l in $(labels); do
+    [ "$l" = "$winner" ] || [ ! -f "$ARENA_DIR/candidates/$l/diff.patch" ] || cp "$ARENA_DIR/candidates/$l/diff.patch" "$env/arena-grafts/$l.patch"
+  done
+  pfile="$env/arena-graft-prompt.txt"; rm -f "$env/arena-report.md"
+  if [ -n "$message" ]; then
+    session="$(mf_get '.final.session // empty')"; printf '%s\n\nWhen done, rewrite %s/arena-report.md (STATUS first line) as before.\n' "$message" "$CONTAINER_ROOT" > "$pfile"
+  else
+    sed -e "s|{{REPO}}|$CONTAINER_ROOT/$REPO_REL|g" -e "s|{{SLUG}}|$SLUG|g" "$PROMPTS_DIR/graft.md" > "$pfile"
+  fi
+  cmd="$(harness_cmd "$harness" "$model" "$session" "$CONTAINER_ROOT/arena-graft-prompt.txt")"
+  log "graft ($harness${model:+ $model}${session:+, resumed}) in $env ..."
+  docker exec -u "$user" -w "$CONTAINER_ROOT" "$container" bash -c "$cmd" < /dev/null > "$env/arena-run.json" 2> "$env/arena-run.log" || warn "graft run exited non-zero; see $env/arena-run.log"
+  session="$(session_from_output "$harness" "$env/arena-run.json")"
+  status="$( { grep -E '^STATUS:' "$env/arena-report.md" 2>/dev/null || true; } | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr -d '[:space:]')"
+  mf_update --arg h "$harness" --arg m "$model" --arg s "$session" --arg n "$name" --arg d "$env" --arg st "${status:-FAILED}" \
+    '.final = {label:"final", harness:$h, model:(if $m=="" then null else $m end), session:(if $s=="" then .final.session else $s end), env_name:$n, env_dir:$d, state:$st} | .status = "grafted"'
+  log "graft finished: ${status:-FAILED}. Nothing is committed: the changes wait in $env/$REPO_REL"
+  gate_candidate final
 }
 
 cmd_promote() {
@@ -829,6 +929,7 @@ cmd_reveal() {
   case "$winner" in ""|none|NONE|None) winner="" ;; esac
   if [ -n "$winner" ] && ! jq -e --arg l "$winner" '.candidates[] | select(.label==$l)' "$MANIFEST" >/dev/null; then warn "judge named '$winner', which is not a label"; winner=""; fi
   echo "arena: $SLUG   mode: $(arena_mode)   winner: ${winner:-(none yet)}"
+  [ "$(arena_plan_by)" = pm ] || echo "base plan: $(mf_get '.plan_verdict.winner // "(none yet)"')"
   printf '%-6s %-9s %-24s %-24s %-8s %-7s %s\n' LABEL HARNESS MODEL AGENTS COST TIME APPROACH
   jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), (.agents // "-"), (.cost_usd // "-" | tostring), (.duration_s // "-" | tostring), (.approach // "-")] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a c t ap; do printf '%-6s %-9s %-24s %-24s %-8s %-7s %s\n' "$l" "$h" "$m" "$a" "$c" "$t" "$ap"; done
   if [ -n "$winner" ]; then
@@ -987,7 +1088,7 @@ case "$cmd" in ""|-h|--help|help) usage; exit 0 ;; --version) echo "$VERSION"; e
 need git; need jq; need ddev; need docker
 resolve_project
 case "$cmd" in
-  doctor) cmd_doctor ;; up) cmd_up ;; init) cmd_init "$@" ;; plan) cmd_plan "$@" ;; spawn) cmd_spawn "$@" ;; run) cmd_run "$@" ;;
+  doctor) cmd_doctor ;; up) cmd_up ;; init) cmd_init "$@" ;; plan) cmd_plan "$@" ;; draft) cmd_draft "$@" ;; merge) cmd_merge "$@" ;; graft) cmd_graft "$@" ;; spawn) cmd_spawn "$@" ;; run) cmd_run "$@" ;;
   wait) cmd_wait "$@" ;; stop) cmd_stop "$@" ;; status) cmd_status "$@" ;; resume) cmd_resume "$@" ;; pm) cmd_pm "$@" ;; gate) cmd_gate "$@" ;;
   collect) cmd_collect "$@" ;; compare) cmd_compare "$@" ;; judge) cmd_judge "$@" ;; promote) cmd_promote "$@" ;; reveal) cmd_reveal "$@" ;; clean) cmd_clean "$@" ;; list) cmd_list ;; review) cmd_review "$@" ;;
   *) die "unknown command '$cmd' (see ai-arena --help)" ;;

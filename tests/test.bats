@@ -670,6 +670,151 @@ git_arena() {
 
 write_report() { printf 'STATUS: DONE\nFILES:\n%s\nEVIDENCE: x\n' "$1" > "$(dirname "$WT")/arena-report.md"; }
 
+# Answers like the containers of a phased arena: PM calls write the brief, the graft call its report.
+phased_docker() {
+  cat > "$TESTDIR/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  ps) printf '%s\n' ddev-base-arena-claude-code ddev-base-tmp-x-a-claude-code ddev-base-feature-x-claude-code ;;
+  exec)
+    printf '%s\n' "$*" >> "$STUB_LOG"
+    [ "$2" = "-d" ] && exit 0
+    case "$*" in
+      *ddev-base-arena-claude-code*) echo contract > "$STUB_BRIEF" ;;
+      *) printf 'STATUS: DONE\nFILES:\nfile.txt\nEVIDENCE: x\n' > "$STUB_ENV/arena-report.md" ;;
+    esac
+    printf '{"type":"result","session_id":"s9","result":"VERDICT: DONE\\nTO: none\\nWINNER: a\\nMESSAGE: ok"}\n' ;;
+esac
+exit 0
+EOF
+  chmod +x "$TESTDIR/bin/docker"
+  export STUB_LOG="$TESTDIR/docker.log" STUB_BRIEF="$COORD_DIR/arena/x/brief.md"
+  local m="$COORD_DIR/arena/x/manifest.json"
+  jq '.plan_by = "candidates" | .candidates[0].state = "DONE" | .candidates[0].session = "s1"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+}
+
+@test "init records --plan-by, refuses bad values and approaches, and each flow rejects the other's verbs" {
+  set -eu -o pipefail
+  stub_tools
+  local coord
+  coord="$(make_coordinator coord-arena mysite repo)"
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Staged task" --plan-by candidates
+  assert_success
+  run jq -r '.plan_by' "$coord/arena/staged-task/manifest.json"
+  assert_output "candidates"
+  run "$SCRIPTS/ai-arena" --project "$coord" plan staged-task
+  assert_failure
+  assert_output --partial "plans in the candidates"
+  run "$SCRIPTS/ai-arena" --project "$coord" run staged-task
+  assert_failure
+  assert_output --partial "ai-arena merge"
+
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Other" --plan-by nobody
+  assert_failure
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Other" --plan-by candidates --approach "x" --approach "y"
+  assert_failure
+  assert_output --partial "does not combine"
+
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Plain task"
+  assert_success
+  run "$SCRIPTS/ai-arena" --project "$coord" draft plain-task
+  assert_failure
+  assert_output --partial "planned by the PM"
+}
+
+@test "merge needs a plan, keeps it blind, stores the base plan and run resumes the planner" {
+  set -eu -o pipefail
+  git_arena
+  phased_docker
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" merge x
+  assert_failure
+  assert_output --partial "no plan to merge"
+
+  echo "my plan" > "$(dirname "$WT")/arena-plan.md"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" merge x
+  assert_success
+  run cat "$COORD_DIR/arena/x/plans/a.md"
+  assert_output "my plan"
+  run jq -r '.status + ":" + .plan_verdict.winner' "$COORD_DIR/arena/x/manifest.json"
+  assert_output "planned:a"
+
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" run x
+  assert_success
+  run tail -n1 "$STUB_LOG"
+  assert_output --partial "s1"
+  run cat "$(dirname "$WT")/arena-prompt.txt"
+  assert_output --partial "It replaces your plan"
+  run cat "$(dirname "$WT")/arena-brief.md"
+  assert_output "contract"
+}
+
+@test "merge warns when a planner changed files" {
+  set -eu -o pipefail
+  git_arena
+  phased_docker
+  echo "my plan" > "$(dirname "$WT")/arena-plan.md"
+  echo changed > "$WT/file.txt"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" merge x
+  assert_success
+  assert_output --partial "changed files while planning"
+}
+
+@test "graft needs a promoted environment, skips an empty list, and gates the final environment" {
+  set -eu -o pipefail
+  git_arena
+  phased_docker
+  local m="$COORD_DIR/arena/x/manifest.json" env="$COORD_DIR/worktree/base-feature-x"
+  echo "port the cache tag from b" > "$COORD_DIR/arena/x/grafts.md"
+  echo contract > "$COORD_DIR/arena/x/brief.md"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" graft x
+  assert_failure
+  assert_output --partial "no promoted environment"
+
+  mkdir -p "$env/.ddev" "$COORD_DIR/arena/x/candidates/b"
+  printf 'name: base-feature-x\ntype: drupal\n' > "$env/.ddev/config.yaml"
+  git -C "$REPO" worktree add -q -b feature/x "$env/app"
+  echo loser > "$COORD_DIR/arena/x/candidates/b/diff.patch"
+  jq --arg d "$env" '.winner = {label:"a", branch:"feature/x", env_dir:$d}
+    | .candidates += [{label:"b", harness:"opencode", branch:"tmp/x-b", env_dir:"/none", state:"DONE"}]' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+
+  echo none > "$COORD_DIR/arena/x/grafts.md"
+  : > "$STUB_LOG"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" graft x
+  assert_success
+  assert_output --partial "nothing to graft"
+  run cat "$STUB_LOG"
+  assert_output ""
+
+  echo "port the cache tag from b" > "$COORD_DIR/arena/x/grafts.md"
+  export STUB_ENV="$env"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" graft x
+  assert_success
+  assert_file_contents() { run cat "$1"; assert_output "$2"; }
+  assert_file_contents "$env/arena-grafts/b.patch" "loser"
+  assert_file_contents "$env/arena-grafts/grafts.md" "port the cache tag from b"
+  assert [ ! -e "$env/arena-grafts/a.patch" ]
+  assert [ -f "$COORD_DIR/arena/x/candidates/final/gates.json" ]
+  run jq -r '.status + ":" + .final.state + ":" + .final.session + ":" + ([.candidates[].label] | join(","))' "$m"
+  assert_output "grafted:DONE:s9:a,b"
+
+  : > "$STUB_LOG"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" graft x --message "fix this"
+  assert_success
+  run cat "$STUB_LOG"
+  assert_output --partial "s9"
+  run cat "$env/arena-graft-prompt.txt"
+  assert_output --partial "fix this"
+}
+
+@test "cli: grafts_empty accepts blanks and none, not a real list" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions grafts_empty)"
+  printf '\n  \n' > "$TESTDIR/g"; run grafts_empty "$TESTDIR/g"; assert_success
+  printf 'None.\n' > "$TESTDIR/g"; run grafts_empty "$TESTDIR/g"; assert_success
+  printf 'none\nport X from b\n' > "$TESTDIR/g"; run grafts_empty "$TESTDIR/g"; assert_failure
+}
+
 @test "promote refuses files the report does not declare and --allow-undeclared overrides it" {
   set -eu -o pipefail
   git_arena
