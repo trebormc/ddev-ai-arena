@@ -95,6 +95,10 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 # harness and by the other candidates' harnesses (0 disables).
 #AI_ARENA_CANDIDATE_REVIEWS=1
 
+# Harnesses that implement in a fresh session, reading their own plan file, instead of
+# resuming their planning session (comma separated; empty resumes every harness).
+#AI_ARENA_RUN_FRESH=opencode
+
 # Repository a candidate's short "@<branch>" agents pin refers to.
 #AI_ARENA_AGENTS_REPO=https://github.com/trebormc/drupal-ai-agents.git
 

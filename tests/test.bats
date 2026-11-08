@@ -678,7 +678,14 @@ case "$1" in
   ps) printf '%s\n' ddev-base-arena-claude-code ddev-base-tmp-x-a-claude-code ddev-base-feature-x-claude-code ;;
   exec)
     printf '%s\n' "$*" >> "$STUB_LOG"
-    [ "$2" = "-d" ] && exit 0
+    if [ "$2" = "-d" ]; then
+      # A detached reviewer inside an environment finishes at once when STUB_ENVROOT maps its root.
+      if [ -n "${STUB_ENVROOT:-}" ]; then
+        p="$(grep -o '/var/www/html/arena-review/[^ ;]*-run.exit' <<< "$*" | head -n1)"
+        [ -z "$p" ] || { mkdir -p "$(dirname "$STUB_ENVROOT${p#/var/www/html}")"; echo 0 > "$STUB_ENVROOT${p#/var/www/html}"; }
+      fi
+      exit 0
+    fi
     case "$*" in
       *ddev-base-arena-claude-code*) echo contract > "$STUB_BRIEF" ;;
       *) printf 'STATUS: DONE\nFILES:\nfile.txt\nEVIDENCE: x\nSELF-REVIEW: no findings\n' > "$STUB_ENV/arena-report.md" ;;
@@ -751,6 +758,19 @@ EOF
   assert_output --partial "It replaces your plan"
   run cat "$(dirname "$WT")/arena-brief.md"
   assert_output "contract"
+
+  # A harness in AI_ARENA_RUN_FRESH starts a new session and is pointed at its own plan.
+  echo 'AI_ARENA_RUN_FRESH=opencode,claude' >> "$COORD_DIR/ai-arena.env"
+  local m="$COORD_DIR/arena/x/manifest.json"
+  jq '.candidates[0].state = "DONE"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  : > "$STUB_LOG"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" run x
+  assert_success
+  run cat "$STUB_LOG"
+  refute_output --partial "s1"
+  run cat "$(dirname "$WT")/arena-prompt.txt"
+  assert_output --partial "you wrote /var/www/html/arena-plan.md"
+  refute_output --partial "It replaces your plan"
 }
 
 @test "merge warns when a planner changed files" {
@@ -948,8 +968,9 @@ EOF
 
   printf '%s\n' ddev-base-arena-claude-code ddev-base-feature-x-claude-code ddev-base-feature-x-opencode > "$TESTDIR/ps"
   : > "$STUB_LOG"
-  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" review --arena x --timeout 1
-  assert_failure
+  export STUB_ENVROOT="$env"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" review --arena x --timeout 30
+  assert_success
   assert_output --partial "reviewers run inside base-feature-x"
   run cat "$STUB_LOG"
   assert_output --partial "ddev-base-feature-x-claude-code"
@@ -964,6 +985,12 @@ EOF
   assert_output "## Act on"
   run cat "$env/arena-brief.md"
   assert_output "contract"
+  # The lead synthesis runs in the coordinator and reads the reviews copied back there.
+  local cd; cd="$COORD_DIR/arena/reviews/$(basename "$rd")"
+  run cat "$cd/lead-prompt.txt"
+  assert_output --partial "/var/www/html/arena/reviews/$(basename "$rd")/r1.md"
+  run test -s "$cd/verdict.md"
+  assert_success
 }
 
 @test "promote refuses files the report does not declare and --allow-undeclared overrides it" {
@@ -1147,6 +1174,12 @@ make_skill() { # repo name
   # A deleted file is a change the report may list.
   rm "$WT/file.txt"
   write_report file.txt
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
+  run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
+  assert_output "pass"
+
+  # A heading with a note still counts, and a note line in FILES is not a path.
+  printf 'STATUS: DONE\nFILES:\nfile.txt\n(file.txt is the only change)\nEVIDENCE: x\nSELF-REVIEW (code-review CODE mode):\n1. none\n' > "$(dirname "$WT")/arena-report.md"
   run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
   run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
   assert_output "pass"

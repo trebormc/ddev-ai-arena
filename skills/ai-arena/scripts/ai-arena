@@ -44,6 +44,10 @@ AI_ARENA_REVIEWERS="claude:opus,opencode"
 AI_ARENA_PLAN_BY="candidates"
 AI_ARENA_DEADLINE_FACTOR=2
 AI_ARENA_CANDIDATE_REVIEWS=1
+# Harnesses that implement in a fresh session instead of resuming their planning session
+# (space or comma separated). OpenCode compacts a long planning context early and can fail
+# when a compaction does not fit; a fresh session reads its own plan file instead.
+AI_ARENA_RUN_FRESH="opencode"
 AI_ARENA_AGENTS_REPO="https://github.com/trebormc/drupal-ai-agents.git"
 
 log()  { printf '==> %s\n' "$*" >&2; }
@@ -79,7 +83,9 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   merge <slug>                             --plan-by candidates: PM picks the best plan, improves it
                                            with the others and writes arena/<slug>/brief.md
   spawn <slug> [label...]                  Create candidate environments (worktree-add --tmp)
-  run <slug> [label...]                    Start candidates (detached) on the brief
+  run <slug> [label...]                    Start candidates (detached) on the brief; planners resume
+                                           their session, except harnesses in AI_ARENA_RUN_FRESH
+                                           (opencode), which start fresh and read their own plan
   wait <slug> [--all] [--timeout S] [--interval S]
                                            Block until a candidate changes state (or all finish);
                                            no timeout by default (AI_ARENA_WAIT_TIMEOUT=0). Once one
@@ -524,7 +530,7 @@ changed_files() { # wt_repo
 }
 
 report_files() { # report -> the FILES section, one path per line, relative to the repository
-  sed -n '/^FILES:/,/^[A-Z][A-Z ]*:/p' "$1" | sed '1d;$d' | sed -E 's/^[-* ]+//; s/[[:space:]]+$//' | { grep -vE '^$|^<' || true; } | sed -E "s#^$REPO_REL/##"
+  sed -n '/^FILES:/,/^[A-Z][A-Z ]*:/p' "$1" | sed '1d;$d' | sed -E 's/^[-* ]+//; s/[[:space:]]+$//' | { grep -vE '^$|^<|^\(' || true; } | sed -E "s#^$REPO_REL/##"
 }
 
 undeclared_files() { # changed_list report_list -> changed paths the report does not list
@@ -627,7 +633,7 @@ gate_candidate() { # label
       [ -n "$rf" ] || continue
       unlisted=$((unlisted+1)); printf 'changed in the tree but not in FILES: %s\n' "$rf" >> "$gdir/report.log"
     done < <(undeclared_files "$gdir/changed-files.txt" "$gdir/report-files.txt")
-    if grep -qiE '^STATUS:[[:space:]]*DONE' "$env_dir/arena-report.md" && ! grep -qE '^SELF-REVIEW:' "$env_dir/arena-report.md"; then
+    if grep -qiE '^STATUS:[[:space:]]*DONE' "$env_dir/arena-report.md" && ! grep -qE '^SELF-REVIEW([[:space:](:]|$)' "$env_dir/arena-report.md"; then
       missing=$((missing+1)); printf 'STATUS DONE without SELF-REVIEW: review your own diff with code-review, fix what it confirms, then report\n' >> "$gdir/report.log"
     fi
     { [ "$missing" = "0" ] && [ "$unlisted" = "0" ]; } || report="fail"
@@ -851,10 +857,17 @@ cmd_run() {
     else
       rm -f "$env_dir/arena-approach.md"
     fi
-    # A planner keeps its session: it already knows the code, and implementing needs no second investigation.
+    # A planner keeps its session: it already knows the code, and implementing needs no second
+    # investigation. A harness in AI_ARENA_RUN_FRESH starts clean and reads its own plan instead,
+    # so it does not begin the implementation with a context already near compaction.
     resume=0
-    if [ "$(arena_plan_by)" = candidates ] && [ -n "$(cand_get "$l" '.session // empty')" ]; then
-      resume=1; note="The project manager merged all the plans into /var/www/html/arena-brief.md. It replaces your plan: where they differ, the brief binds, whoever wrote the idea."
+    if [ "$(arena_plan_by)" = candidates ]; then
+      if [[ " ${AI_ARENA_RUN_FRESH//,/ } " == *" $(cand_get "$l" '.harness') "* ]]; then
+        note="The project manager merged all the plans into /var/www/html/arena-brief.md: it is the task."
+        [ ! -s "$env_dir/arena-plan.md" ] || note+=" In the planning phase you wrote /var/www/html/arena-plan.md: reuse the facts it verified instead of investigating them again; where it differs from the brief, the brief binds."
+      elif [ -n "$(cand_get "$l" '.session // empty')" ]; then
+        resume=1; note="The project manager merged all the plans into /var/www/html/arena-brief.md. It replaces your plan: where they differ, the brief binds, whoever wrote the idea."
+      fi
     fi
     p="${prompt//\{\{APPROACH_NOTE\}\}/$note}"
     launch_candidate "$l" "$p" "$resume"
@@ -1252,8 +1265,9 @@ cmd_review() {
     fi
     log "reviewer $l: $(grep -c -E '^\s*-\s|^[0-9]+\.' "$dir/$l.md" || true) lines of findings"
   done
-  # Lead synthesis in the PM harness (blind to which model wrote which review).
-  local harness model user container pfile out logf cmd
+  # Lead synthesis in the PM harness (blind to which model wrote which review), in the
+  # coordinator, which sees the review folder at $cdir.
+  local harness model user container pfile out logf cmd cdir="$CONTAINER_ROOT/${dir#"$PROJECT"/}"
   harness="$AI_ARENA_PM_HARNESS"; model="$AI_ARENA_PM_MODEL"; user="$(harness_user "$harness")"; container="$(container_for "$harness" "$COORD")"
   container_running "$container" || die "container $container is not running (ai-arena up)"
   { sed -e "s|{{DIFF}}|$cdir/diff.patch|g" -e "s|{{INTENT}}|$cdir/intent.txt|g" -e "s|{{TREE}}|$tree_c|g" -e "s|{{VERDICT}}|$cdir/verdict.md|g" -e "s|{{REVIEWS}}|$(printf '%s ' "${labels[@]/#/$cdir/}" | sed 's/ $//; s|\([^ ]*\)|\1.md|g')|g" "$PROMPTS_DIR/review-lead.md"; } > "$dir/lead-prompt.txt"

@@ -83,7 +83,9 @@ until nothing is left to act on. Arenas made with
    fail in the candidates' containers. On `VERDICT: ASK_USER`, put the question to the user,
    then `ai-arena pm <slug> "<answer>"` and ask it to write the brief.
 6. **Run.** `ai-arena run <slug>`: each candidate continues its planning session on the
-   merged brief. Detached; candidates keep working even if this session ends.
+   merged brief, except harnesses listed in `AI_ARENA_RUN_FRESH` (default `opencode`): they
+   start a fresh session that reads their own plan file, because a planning context near its
+   limit makes OpenCode compact early and can end the run with `compaction.failed`. Detached; candidates keep working even if this session ends.
 7. **Wait loop.** `ai-arena wait <slug>` blocks until any candidate changes state
    (`--all` for all; no timeout unless `--timeout S`). Run it in the background and react:
    - `DONE` → keep waiting for the rest. The first `DONE` of a phase sets the **deadline**:

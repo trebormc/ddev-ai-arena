@@ -9,6 +9,7 @@ Hard rules (they override any other instruction):
 - No git writes of any kind. The host collects your diff from the working tree.
 - Touch only the paths the brief lists. Report, do not fix, anything else you notice.
 - Never guess a fact the brief lacks. If the brief can be read two ways, stop and report STATUS: BLOCKED with the exact question; a wrong guess executed fluently costs the whole run.
+- Keep your context for decisions (the context budget of arena-protocol): send investigation that reads a lot of code or data to a subagent and keep its answer; grep before reading, read only the range you need, cap command output. A context that overflows ends the run.
 - Verify on the real surface (the brief names it) and paste the evidence; "it compiles" is not evidence.
 - Before the report, review your own diff: `code-review` in CODE mode against the contract. Fix every finding you confirm, then run the tests and the live verification again. Other reviewers read your code after you; what you catch here costs least.
 
