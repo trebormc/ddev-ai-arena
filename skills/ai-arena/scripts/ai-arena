@@ -23,6 +23,9 @@ PROMPTS_DIR="$SCRIPT_DIR/../prompts"
 CONTAINER_ROOT="/var/www/html"
 WINS_LOG="${HOME}/.ddev/ai-arena/wins.tsv"
 GLOBAL_CONFIG="${HOME}/.ddev/ai-arena/config.env"
+# What a reviewer is told about the site it can use ({{RUNTIME}} in prompts/review.md).
+REVIEW_OFFLINE="You have no running Drupal and cannot run drush or tests; say what you would have run."
+REVIEW_LIVE="This environment runs the site of the code under review, with its own database: use it. Run the tests the change touches and the live verification of the brief, query with \`ssh web drush ...\`, open the pages, and confirm or refute each finding by running it; paste the command and its output beside the finding. Never change code, config or modules (no cim, cex, en, pmu, updb, cr is fine); name any content you create for a probe with the prefix arena-review- and delete it when done. Another reviewer may be using the same site at the same time."
 
 # ---------------------------------------------------------------------------
 # Defaults, then ~/.ddev/ai-arena/config.env, then <project>/ai-arena.env
@@ -38,7 +41,9 @@ AI_ARENA_DB="auto"
 AI_ARENA_LOCAL_FILES=""
 AI_ARENA_MAIN_ENV=""
 AI_ARENA_REVIEWERS="claude:opus,opencode"
-AI_ARENA_PLAN_BY="pm"
+AI_ARENA_PLAN_BY="candidates"
+AI_ARENA_DEADLINE_FACTOR=2
+AI_ARENA_CANDIDATE_REVIEWS=1
 AI_ARENA_AGENTS_REPO="https://github.com/trebormc/drupal-ai-agents.git"
 
 log()  { printf '==> %s\n' "$*" >&2; }
@@ -77,7 +82,12 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   run <slug> [label...]                    Start candidates (detached) on the brief
   wait <slug> [--all] [--timeout S] [--interval S]
                                            Block until a candidate changes state (or all finish);
-                                           no timeout by default (AI_ARENA_WAIT_TIMEOUT=0)
+                                           no timeout by default (AI_ARENA_WAIT_TIMEOUT=0). Once one
+                                           candidate finishes a phase DONE, the others get
+                                           AI_ARENA_DEADLINE_FACTOR (2) times its time, then are stopped;
+                                           each finished implementation is reviewed meanwhile, in its
+                                           own environment, by a fresh session of its own harness and
+                                           by the other candidates' harnesses
   stop <slug> <label...>                   Kill a running candidate's harness and settle its state
                                            from the report it has written so far
   status <slug> [--json]                   Show candidate states
@@ -97,8 +107,12 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
   clean <slug> [--keep label] [--purge]    Delete candidate environments and tmp/ branches (the winner's
                                            tmp/ branch too, once the promoted branch contains it)
   list                                     Arenas in this project
-  review (--branch <b> | --env <dir> | --patch <file>) [--reviewers a,b] [--intent "..."] [--timeout S]
-                                           Multi-model review of one diff: independent reviewers, then a lead synthesis
+  review (--arena <slug> | --branch <b> | --env <dir> | --patch <file>) [--reviewers a,b] [--intent "..."] [--timeout S]
+                                           Multi-model review of one diff: independent reviewers, then a lead synthesis.
+                                           An environment is reviewed inside it, with its site, when its AI containers run.
+                                           --arena reviews the arena's final code with a fresh session of the harness that
+                                           wrote it plus the other candidates' harnesses, and after a fix checks the
+                                           previous Act-on list and what changed
 
 Config: ~/.ddev/ai-arena/config.env (all projects), <project>/ai-arena.env (this project)
 EOF
@@ -343,7 +357,7 @@ launch_candidate() { # label prompt_text resume(0|1)
   cmd="$(harness_cmd "$harness" "$model" "$session" "$CONTAINER_ROOT/arena-prompt.txt")"
   docker exec -d -u "$user" -w "$CONTAINER_ROOT" "$container" \
     bash -c "{ $cmd; } > $CONTAINER_ROOT/arena-run.json 2> $CONTAINER_ROOT/arena-run.log; echo \$? > $CONTAINER_ROOT/arena-run.exit"
-  cand_set "$label" state running; cand_set "$label" started "$(now)"
+  cand_set "$label" state running; cand_set "$label" started "$(now)"; cand_set_json "$label" cut false
   log "candidate $label running in $container ($harness${model:+ $model}${session:+, resumed})"
 }
 
@@ -378,7 +392,115 @@ settle_candidate() { # label -> prints new state
   case "$status" in DONE|BLOCKED|FAILED|PARTIAL) ;; *) status="FAILED" ;; esac
   cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"
   record_round "$label" "$harness" "$exit_code" "$status"
+  deadline_note "$label" "$status"
+  case "$status" in DONE|PARTIAL)
+    if [ "$(mf_get '.status')" = running ] && [ "$(cand_get "$label" '.cut // false')" != true ]; then candidate_reviews_launch "$label"; fi ;;
+  esac
   echo "$status"
+}
+
+# Phase deadline. The first candidate that finishes a phase (drafting or running) DONE sets
+# it: every other one gets AI_ARENA_DEADLINE_FACTOR times that duration, counted from its own
+# start, and `wait` stops it after that. Its work so far is still collected and judged.
+deadline_note() { # label state
+  [ "$2" = DONE ] || return 0
+  case "${AI_ARENA_DEADLINE_FACTOR:-0}" in 0|0.0|"") return 0 ;; esac
+  local phase dur; phase="$(mf_get '.status')"
+  case "$phase" in drafting|running) ;; *) return 0 ;; esac
+  [ "$(mf_get '.deadline.phase // empty')" != "$phase" ] || return 0
+  dur="$(cand_get "$1" '.rounds[-1].duration_s // empty')"; [ -n "$dur" ] || return 0
+  mf_update --arg l "$1" --arg p "$phase" --argjson d "$dur" --argjson f "$AI_ARENA_DEADLINE_FACTOR" \
+    '.deadline = {phase:$p, label:$l, first_s:$d, factor:$f, limit_s:(($d * $f) | floor)}'
+  log "candidate $1 finished $phase first (${dur}s): the others get $(mf_get '.deadline.limit_s')s each from their start"
+}
+
+DEADLINE_STOPPED=""
+enforce_deadline() { # stop the candidates of this phase that ran past the deadline
+  local limit l started el; DEADLINE_STOPPED=""
+  limit="$(jq -r '.status as $p | if .deadline and .deadline.phase == $p then .deadline.limit_s else empty end' "$MANIFEST")"
+  [ -n "$limit" ] || return 0
+  for l in $(labels); do
+    [ "$(cand_get "$l" '.state')" = running ] || continue
+    started="$(cand_get "$l" '.started // empty')"; [ -n "$started" ] || continue
+    el=$(( $(date -u +%s) - $(date -u -d "$started" +%s) ))
+    [ "$el" -ge "$limit" ] || continue
+    warn "candidate $l ran ${el}s, past the deadline of ${limit}s ($(mf_get '.deadline.factor')x candidate $(mf_get '.deadline.label')): stopping it; its work so far is still judged"
+    cand_set_json "$l" cut true
+    stop_candidate "$l"
+    DEADLINE_STOPPED+="$l "
+  done
+}
+
+# Candidate reviews. The candidate already reviewed and fixed its own diff before reporting.
+# When it finishes its implementation, two more reviews start at once, inside its own
+# environment with its running site: `self`, a fresh session of its own harness and model
+# (no memory of writing the code), and `x1`, `x2`..., the other candidates' harnesses. They
+# run while the slower candidates still work; `judge` waits for them and reads them beside
+# each diff. The labels say self or other, never the model.
+xreviewers_for() { # label -> one "harness:model" line per other harness among the candidates
+  jq -r --arg h "$(cand_get "$1" '.harness')" '[.candidates[] | select(.harness != $h) | .harness + ":" + (.model // "")] | unique | .[]' "$MANIFEST"
+}
+
+review_prompt() { # diff intent tree out runtime -> the reviewer prompt
+  sed -e "s|{{DIFF}}|$1|g" -e "s|{{INTENT}}|$2|g" -e "s|{{TREE}}|$3|g" -e "s|{{OUT}}|$4|g" -e "s|{{RUNTIME}}|$5|g" "$PROMPTS_DIR/review.md"
+}
+
+candidate_reviews_launch() { # label
+  [ "${AI_ARENA_CANDIDATE_REVIEWS:-1}" = 1 ] || return 0
+  local label="$1" env_dir env_name dir cdir rl harness model spec n=0 container prompt specs
+  env_dir="$(cand_get "$label" '.env_dir')"; env_name="$(cand_get "$label" '.env_name')"
+  collect_candidate "$label"
+  [ -s "$ARENA_DIR/candidates/$label/diff.patch" ] || { warn "candidate $label changed nothing: no review"; return 0; }
+  dir="$env_dir/arena-review"; cdir="$CONTAINER_ROOT/arena-review"
+  rm -rf "$dir"; mkdir -p "$dir"; cp "$ARENA_DIR/candidates/$label/diff.patch" "$dir/diff.patch"
+  changed_files "$env_dir/$REPO_REL" > "$dir/tree-before.txt"
+  printf 'One implementation of an arena task. The binding contract is %s/arena-brief.md: check conformance with it (scope, rubric, required tests) besides correctness. The author report is %s/arena-report.md; its claims are unverified.\n' \
+    "$CONTAINER_ROOT" "$CONTAINER_ROOT" > "$dir/intent.txt"
+  specs="self $(cand_get "$label" '.harness'):$(cand_get "$label" '.model // empty')"
+  if [ "$(arena_mode)" = models ]; then
+    while IFS= read -r spec; do [ -n "$spec" ] || continue; n=$((n + 1)); specs+=$'\n'"x$n $spec"; done < <(xreviewers_for "$label")
+  fi
+  cand_set_json "$label" reviewers '[]'
+  while read -r rl spec; do
+    harness="${spec%%:*}"; model="${spec#*:}"; container="$(container_for "$harness" "$env_name")"
+    container_running "$container" || { warn "cannot review $label with $harness: $container is not running"; continue; }
+    prompt="$(review_prompt "$cdir/diff.patch" "$cdir/intent.txt" "$CONTAINER_ROOT/$REPO_REL" "$cdir/$rl.md" "$REVIEW_LIVE")"
+    review_launch "$container" "$harness" "$model" "$rl" "$dir" "$cdir" "$prompt"
+    mf_update --arg l "$label" --arg r "$rl" --arg h "$harness" --arg m "$model" \
+      '(.candidates[] | select(.label==$l)).reviewers += [{label:$r, harness:$h, model:(if $m=="" then null else $m end)}]'
+  done <<< "$specs"
+}
+
+candidate_reviews_finish() { # wait for the candidate reviews, then put them beside each diff for the judge
+  local start l rl dir pending h stray
+  start="$(date +%s)"
+  while :; do
+    pending=0
+    for l in $(labels); do for rl in $(cand_get "$l" '.reviewers // [] | .[].label'); do
+      [ -f "$(cand_get "$l" '.env_dir')/arena-review/$rl-run.exit" ] || pending=$((pending + 1))
+    done; done
+    [ "$pending" = 0 ] && break
+    if [ "$AI_ARENA_TIMEOUT" -gt 0 ] && [ $(( $(date +%s) - start )) -ge "$AI_ARENA_TIMEOUT" ]; then warn "$pending candidate review(s) still running; judging without them"; break; fi
+    [ $(( $(date +%s) - start )) -ge 10 ] || log "waiting for $pending candidate review(s)"
+    sleep 10
+  done
+  for l in $(labels); do
+    dir="$(cand_get "$l" '.env_dir')/arena-review"
+    for rl in $(cand_get "$l" '.reviewers // [] | .[].label'); do
+      [ -f "$dir/$rl-run.exit" ] || continue
+      if [ ! -s "$dir/$rl.md" ]; then
+        h="$(cand_get "$l" ".reviewers[] | select(.label==\"$rl\") | .harness")"
+        result_text "$h" "$dir/$rl-run.json" > "$dir/$rl.md" 2>/dev/null || true
+        [ -s "$dir/$rl.md" ] || printf 'NO REVIEW PRODUCED (exit %s)\n' "$(cat "$dir/$rl-run.exit")" > "$dir/$rl.md"
+      fi
+      mkdir -p "$ARENA_DIR/candidates/$l"; cp "$dir/$rl.md" "$ARENA_DIR/candidates/$l/review-$rl.md"
+    done
+    if [ -f "$dir/tree-before.txt" ]; then
+      # Reviewers read the tree, they must not write in it: anything new would reach the diff.
+      stray="$(undeclared_files <(changed_files "$(cand_get "$l" '.env_dir')/$REPO_REL") "$dir/tree-before.txt")"
+      [ -z "$stray" ] || warn "a reviewer of $l left files in its tree (remove them, then gate again):"$'\n'"$stray"
+    fi
+  done
 }
 
 status_json() {
@@ -505,6 +627,9 @@ gate_candidate() { # label
       [ -n "$rf" ] || continue
       unlisted=$((unlisted+1)); printf 'changed in the tree but not in FILES: %s\n' "$rf" >> "$gdir/report.log"
     done < <(undeclared_files "$gdir/changed-files.txt" "$gdir/report-files.txt")
+    if grep -qiE '^STATUS:[[:space:]]*DONE' "$env_dir/arena-report.md" && ! grep -qE '^SELF-REVIEW:' "$env_dir/arena-report.md"; then
+      missing=$((missing+1)); printf 'STATUS DONE without SELF-REVIEW: review your own diff with code-review, fix what it confirms, then report\n' >> "$gdir/report.log"
+    fi
     { [ "$missing" = "0" ] && [ "$unlisted" = "0" ]; } || report="fail"
   fi
   jq -n --arg site "$site" --arg config "$config" --arg phpstan "$phpstan" --arg phpcs "$phpcs" --arg phpunit "$phpunit" --arg report "$report" --arg logs "$gdir" --arg targets "$targets" \
@@ -513,13 +638,16 @@ gate_candidate() { # label
   jq -c . "$gdir/../gates.json"
 }
 
+tree_diff() { # wt_repo -> tracked diff plus new files, against the branch's last commit
+  local f
+  git -C "$1" diff HEAD 2>/dev/null || true
+  git -C "$1" ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do git -C "$1" diff --no-index -- /dev/null "$f" 2>/dev/null || true; done
+}
+
 collect_candidate() { # label
-  local label="$1" env_dir wt_repo cdir f
+  local label="$1" env_dir wt_repo cdir
   env_dir="$(cand_get "$label" '.env_dir')"; wt_repo="$env_dir/$REPO_REL"; cdir="$ARENA_DIR/candidates/$label"; mkdir -p "$cdir"
-  {
-    git -C "$wt_repo" diff HEAD 2>/dev/null || true
-    git -C "$wt_repo" ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do git -C "$wt_repo" diff --no-index -- /dev/null "$f" 2>/dev/null || true; done
-  } > "$cdir/diff.patch"
+  tree_diff "$wt_repo" > "$cdir/diff.patch"
   changed_files "$wt_repo" > "$cdir/files-changed.txt"
   if [ -f "$env_dir/arena-report.md" ]; then cp "$env_dir/arena-report.md" "$cdir/report.md"; else printf 'STATUS: FAILED\n(no report written)\n' > "$cdir/report.md"; fi
   # No harness or model information lands here (not even the harness log): the judge stays blind.
@@ -554,7 +682,7 @@ cmd_up() { log "ddev start ($COORD)"; (cd "$PROJECT" && ddev start -y); }
 
 cmd_init() {
   local task="" candidates="$AI_ARENA_DEFAULT_CANDIDATES" pm="${AI_ARENA_PM_HARNESS}${AI_ARENA_PM_MODEL:+:$AI_ARENA_PM_MODEL}" description="" force=0
-  local mode="models" approach_texts=() plan_by="$AI_ARENA_PLAN_BY"
+  local mode="models" approach_texts=() plan_by=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --candidates) candidates="$2"; shift 2 ;; --pm) pm="$2"; shift 2 ;; --description) description="$2"; shift 2 ;; --force) force=1; shift ;;
@@ -566,6 +694,8 @@ cmd_init() {
   done
   [ -n "$task" ] || die "usage: init \"<task>\" [--candidates a,b] [--pm harness[:model]] [--description \"...\"] [--approaches | --approach \"...\" ...]"
   [ -n "$description" ] || description="$task"
+  # Approaches give each label its design already, so they keep the PM brief unless told otherwise.
+  if [ -z "$plan_by" ]; then if [ "$mode" = approaches ]; then plan_by=pm; else plan_by="$AI_ARENA_PLAN_BY"; fi; fi
   case "$plan_by" in pm|candidates) ;; *) die "--plan-by must be pm or candidates" ;; esac
   [ "$plan_by" = pm ] || [ "$mode" = models ] || die "--plan-by candidates does not combine with approaches: there each label already has its design"
   local slug dir; slug="$(slugify "$task")"; [ -n "$slug" ] || die "cannot derive a slug from '$task'"; dir="$(arena_dir "$slug")"
@@ -660,7 +790,7 @@ cmd_draft() { # phase 1: every candidate investigates and writes its own plan
     printf '# Arena task: %s\n\n## Task\n%s\n\n%s\n' "$SLUG" "$(mf_get '.task')" "$(mf_get '.description')" > "$env_dir/arena-brief.md"
     launch_candidate "$l" "$prompt" 0
   done
-  mf_update '.status = "drafting"'
+  mf_update '.status = "drafting" | .deadline = null'
 }
 
 collect_plans() { # copy each finished plan under blind labels; prints the labels that have one
@@ -681,6 +811,8 @@ cmd_merge() { # phase 1 ends: the PM turns the plans into the one brief everybod
   for l in $(labels); do [ "$(cand_get "$l" '.state')" != running ] || die "candidate $l is still running (ai-arena wait $SLUG --all)"; done
   got="$(collect_plans)"; [ -n "$got" ] || die "no plan to merge (ai-arena draft $SLUG)"
   msg="$(fill_prompt merge.md)"; msg="${msg//\{\{TASK\}\}/$(mf_get '.description')}"; msg="${msg//\{\{PLANS\}\}/$CONTAINER_ARENA/plans/ ($got)}"
+  local cut; cut="$(jq -r '[.candidates[] | select(.cut == true) | .label] | join(" ")' "$MANIFEST")"
+  [ -z "$cut" ] || msg+=$'\n\n'"STOPPED AT THE DEADLINE: $cut ran past the time limit and their plans are unfinished. They cannot be the base plan; take from them only what is sound and checked against the code."
   out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.plan_verdict = $j'
   if [ -s "$ARENA_DIR/brief.md" ]; then check_brief; mf_update '.status = "planned"'; log "brief written: $ARENA_DIR/brief.md"
   else warn "the PM wrote no brief yet; answer it with 'ai-arena pm' and ask it to write brief.md"; fi
@@ -727,7 +859,7 @@ cmd_run() {
     p="${prompt//\{\{APPROACH_NOTE\}\}/$note}"
     launch_candidate "$l" "$p" "$resume"
   done
-  mf_update '.status = "running"'
+  mf_update '.status = "running" | .deadline = null'
 }
 
 cmd_resume() {
@@ -741,28 +873,33 @@ cmd_resume() {
 cmd_stop() { # kill a running candidate's harness; settle its state from the report written so far
   mf_require "${1:-}"; shift || true
   [ $# -gt 0 ] || die "usage: stop <slug> <label...>"
-  local l harness env_name env_dir container user st
+  local l
   for l in "$@"; do
     guard_label "$l"
     [ "$(cand_get "$l" '.state')" = "running" ] || { warn "candidate $l is not running"; continue; }
-    harness="$(cand_get "$l" '.harness')"; env_name="$(cand_get "$l" '.env_name')"; env_dir="$(cand_get "$l" '.env_dir')"
-    user="$(harness_user "$harness")"; container="$(container_for "$harness" "$env_name")"
-    if container_running "$container"; then
-      # Everything the harness user runs in that container belongs to this run (the wrapper,
-      # the harness, its subagents and tool processes). TERM first, KILL what survives.
-      docker exec -u root "$container" pkill -TERM -u "$user" >/dev/null 2>&1 || true
-      sleep 5
-      docker exec -u root "$container" pkill -KILL -u "$user" >/dev/null 2>&1 || true
-    else
-      warn "container $container is not running"
-    fi
-    # The wrapper writes arena-run.exit itself when it survives the kill; otherwise record it.
-    sleep 2
-    [ -f "$env_dir/arena-run.exit" ] || echo 143 > "$env_dir/arena-run.exit"
-    st="$(settle_candidate "$l")"
-    log "candidate $l stopped -> $st (exit $(cat "$env_dir/arena-run.exit"))"
+    stop_candidate "$l"
   done
   status_json
+}
+
+stop_candidate() { # label -> kill its harness, then settle its state from the report written so far
+  local l="$1" harness env_name env_dir container user st
+  harness="$(cand_get "$l" '.harness')"; env_name="$(cand_get "$l" '.env_name')"; env_dir="$(cand_get "$l" '.env_dir')"
+  user="$(harness_user "$harness")"; container="$(container_for "$harness" "$env_name")"
+  if container_running "$container"; then
+    # Everything the harness user runs in that container belongs to this run (the wrapper,
+    # the harness, its subagents and tool processes). TERM first, KILL what survives.
+    docker exec -u root "$container" pkill -TERM -u "$user" >/dev/null 2>&1 || true
+    sleep 5
+    docker exec -u root "$container" pkill -KILL -u "$user" >/dev/null 2>&1 || true
+  else
+    warn "container $container is not running"
+  fi
+  # The wrapper writes arena-run.exit itself when it survives the kill; otherwise record it.
+  sleep 2
+  [ -f "$env_dir/arena-run.exit" ] || echo 143 > "$env_dir/arena-run.exit"
+  st="$(settle_candidate "$l")"
+  log "candidate $l stopped -> $st (exit $(cat "$env_dir/arena-run.exit"))"
 }
 
 cmd_wait() {
@@ -776,6 +913,7 @@ cmd_wait() {
       [ "$(cand_get "$l" '.state')" = "running" ] || continue
       st="$(settle_candidate "$l")"; [ "$st" = "running" ] || { changed=1; log "candidate $l -> $st"; }
     done
+    enforce_deadline; [ -z "$DEADLINE_STOPPED" ] || changed=1
     [ "$changed" = "1" ] && [ "$all" = "0" ] && break
     jq -e '.candidates[] | select(.state=="running")' "$MANIFEST" >/dev/null || break
     if [ "$timeout" -gt 0 ] && [ $(( $(date +%s) - start )) -ge "$timeout" ]; then status_json; die "timeout after ${timeout}s with candidates still running"; fi
@@ -787,7 +925,17 @@ cmd_wait() {
 cmd_status() {
   mf_require "${1:-}"; shift || true
   local l; for l in $(labels); do [ "$(cand_get "$l" '.state')" = "running" ] && settle_candidate "$l" >/dev/null; done
-  if [ "${1:-}" = "--json" ]; then status_json; else echo "arena: $SLUG ($(mf_get '.status'))  task: $(mf_get '.task')"; status_table; fi
+  if [ "${1:-}" = "--json" ]; then status_json; else
+    echo "arena: $SLUG ($(mf_get '.status'))  task: $(mf_get '.task')"; status_table
+    [ -z "$(mf_get '.winner.env_dir // empty')" ] || echo "final code: $(final_review_state)"
+  fi
+}
+
+final_review_state() { # whether the last `review --arena` read the code as it is now
+  local env last; env="$(mf_get '.winner.env_dir // empty')"; last="$(mf_get '.reviews // [] | last | .diff_sha // empty')"
+  if [ -z "$last" ]; then echo "not reviewed (ai-arena review --arena $SLUG)"
+  elif [ "$(tree_diff "$env/$REPO_REL" | sha256sum | cut -d' ' -f1)" = "$last" ]; then echo "reviewed as it is ($(mf_get '.reviews | last | .dir'))"
+  else echo "changed since the last review (ai-arena review --arena $SLUG)"; fi
 }
 
 cmd_pm() { mf_require "${1:-}"; shift || true; [ -n "${1:-}" ] || die "usage: pm <slug> \"<message>\""; pm_call "$1"; }
@@ -847,8 +995,16 @@ cmd_judge() {
   if [ "$(identical_production)" = "yes" ]; then
     block+="${block:+ }MECHANICAL NOTE: the production code of every candidate is identical (only tests, docs or translations differ). Say so first in your verdict: the ranking can only reflect tests, evidence and reporting, not which implementation is better."
   fi
+  candidate_reviews_finish
+  if ls "$ARENA_DIR"/candidates/*/review-*.md >/dev/null 2>&1; then
+    block+="${block:+ }REVIEWS: each candidate reviewed and fixed its own diff before reporting (SELF-REVIEW in report.md). Then candidates/L/review-self.md was written by a fresh session of the same model as L's author, and review-x1.md (x2...) by different models, all with L's site running. A finding raised by both self and another is the strongest signal; one only another model raised is the author's blind spot. Treat every finding as a lead: confirm it in the diff, the code or the pasted output, or refute it in one line. Confirmed ones weigh in the ranking and must be named in your verdict so they get fixed."
+  fi
+  local cut; cut="$(jq -r '[.candidates[] | select(.cut == true) | .label] | join(" ")' "$MANIFEST")"
+  if [ -n "$cut" ]; then
+    block+="${block:+ }STOPPED AT THE DEADLINE: $cut ran past $(mf_get '.deadline.factor // 2')x the time of the first candidate to finish and were stopped unfinished. They cannot win. Read their diffs anyway: anything they did better than the winner, even half done, is a graft."
+  fi
   if [ "$(arena_plan_by)" = candidates ]; then
-    block+="${block:+ }GRAFTS: besides the winner, write $CONTAINER_ARENA/grafts.md, the list a fresh agent will port into the winner: one item per concrete improvement, naming the source label, its file, what to port and why it beats the winner's version. Only what is clearly better; write the single word none if nothing is."
+    block+="${block:+ }GRAFTS: besides the winner, write $CONTAINER_ARENA/grafts.md, the list a fresh agent will port into the winner: one item per concrete improvement, naming the source label, its file, what to port and why it beats the winner's version, plus one item per confirmed review finding on the winner, as a fix. Only what is clearly better or confirmed; write the single word none if nothing is."
   fi
   msg="${msg//\{\{APPROACHES\}\}/$block}"
   out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.judge = $j | .status = "judged"'; printf '%s\n' "$out"
@@ -865,7 +1021,7 @@ cmd_graft() { # last phase: the best parts of the losers, in the real environmen
   local winner env grafts; winner="$(mf_get '.winner.label // empty')"; env="$(mf_get '.winner.env_dir // empty')"; grafts="$ARENA_DIR/grafts.md"
   { [ -n "$winner" ] && [ -n "$env" ] && [ -d "$env" ]; } || die "no promoted environment (ai-arena promote $SLUG <winner> --env)"
   [ -f "$grafts" ] || die "no $grafts (the judge writes it in --plan-by candidates arenas; 'ai-arena pm' can ask for it)"
-  if [ -z "$message" ] && grafts_empty "$grafts"; then log "the judge listed nothing to graft"; return 0; fi
+  if [ -z "$message" ] && grafts_empty "$grafts"; then log "the judge listed nothing to graft; next: ai-arena review --arena $SLUG"; return 0; fi
   local harness model session="" name container user l pfile cmd status
   harness="$(cand_get "$winner" '.harness')"; model="$(cand_get "$winner" '.model // empty')"; name="$(ddev_name "$env")"
   user="$(harness_user "$harness")"; container="$(container_for "$harness" "$name")"
@@ -889,6 +1045,7 @@ cmd_graft() { # last phase: the best parts of the losers, in the real environmen
     '.final = {label:"final", harness:$h, model:(if $m=="" then null else $m end), session:(if $s=="" then .final.session else $s end), env_name:$n, env_dir:$d, state:$st} | .status = "grafted"'
   log "graft finished: ${status:-FAILED}. Nothing is committed: the changes wait in $env/$REPO_REL"
   gate_candidate final
+  log "next: ai-arena review --arena $SLUG (the harnesses that did not write this code review it)"
 }
 
 cmd_promote() {
@@ -977,11 +1134,10 @@ cmd_list() { local m; shopt -s nullglob; for m in "$PROJECT"/arena/*/manifest.js
 # ---------------------------------------------------------------------------
 # Review: N independent reviewers on one diff (different harnesses/models), then a lead synthesis
 # ---------------------------------------------------------------------------
-review_launch() { # harness model label dir prompt_text -> detached run in the coordinator's container
-  local harness="$1" model="$2" label="$3" dir="$4" prompt="$5" user container cmd cdir
-  user="$(harness_user "$harness")"; container="$(container_for "$harness" "$COORD")"
-  container_running "$container" || die "container $container is not running (ai-arena up)"
-  cdir="$CONTAINER_ROOT/${dir#"$PROJECT"/}"
+review_launch() { # container harness model label host_dir container_dir prompt_text -> detached run in that container
+  local container="$1" harness="$2" model="$3" label="$4" dir="$5" cdir="$6" prompt="$7" user cmd
+  user="$(harness_user "$harness")"
+  container_running "$container" || die "container $container is not running"
   printf '%s\n' "$prompt" > "$dir/$label-prompt.txt"
   rm -f "$dir/$label-run.json" "$dir/$label-run.log" "$dir/$label-run.exit" "$dir/$label.md"
   cmd="$(harness_cmd "$harness" "$model" "" "$cdir/$label-prompt.txt")"
@@ -991,15 +1147,29 @@ review_launch() { # harness model label dir prompt_text -> detached run in the c
 }
 
 cmd_review() {
-  local branch="" env="" patch="" reviewers="$AI_ARENA_REVIEWERS" intent="" timeout="$AI_ARENA_TIMEOUT"
+  local branch="" env="" patch="" reviewers="$AI_ARENA_REVIEWERS" reviewers_given=0 intent="" timeout="$AI_ARENA_TIMEOUT" arena="" prev=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --arena) arena="${2:?}"; shift 2 ;;
       --branch) branch="${2:?}"; shift 2 ;; --env) env="${2:?}"; shift 2 ;; --patch) patch="${2:?}"; shift 2 ;;
-      --reviewers) reviewers="${2:?}"; shift 2 ;; --intent) intent="${2:?}"; shift 2 ;; --timeout) timeout="${2:?}"; shift 2 ;;
+      --reviewers) reviewers="${2:?}"; reviewers_given=1; shift 2 ;; --intent) intent="${2:?}"; shift 2 ;; --timeout) timeout="${2:?}"; shift 2 ;;
       *) die "unknown option $1" ;;
     esac
   done
-  [ -n "$branch$env$patch" ] || die "usage: review (--branch <b> | --env <dir> | --patch <file>) [--reviewers a,b] [--intent \"...\"]"
+  local winner="" wspec=""
+  if [ -n "$arena" ]; then
+    # The arena's final code, in its promoted environment, read against the contract. Default
+    # panel: a fresh session of the harness that wrote it plus the other candidates' harnesses.
+    mf_require "$arena"
+    env="$(mf_get '.winner.env_dir // empty')"; { [ -n "$env" ] && [ -d "$env" ]; } || die "arena $arena has no promoted environment (ai-arena promote $arena <winner> --env)"
+    winner="$(mf_get '.winner.label')"
+    wspec="$(mf_get '.final.harness // empty')"
+    if [ -n "$wspec" ]; then wspec="$wspec:$(mf_get '.final.model // empty')"; else wspec="$(cand_get "$winner" '.harness'):$(cand_get "$winner" '.model // empty')"; fi
+    [ "$reviewers_given" = 1 ] || reviewers="$(printf '%s\n' "$wspec" "$(xreviewers_for "$winner")" | grep -v '^$' | paste -sd, -)"
+    prev="$(mf_get '.reviews // [] | last | .dir // empty')"
+    cp "$ARENA_DIR/brief.md" "$env/arena-brief.md" 2>/dev/null || true
+  fi
+  [ -n "$branch$env$patch" ] || die "usage: review (--arena <slug> | --branch <b> | --env <dir> | --patch <file>) [--reviewers a,b] [--intent \"...\"]"
   local id dir tree_c
   id="review-$(date +%Y%m%d-%H%M%S)"; dir="$PROJECT/arena/reviews/$id"; mkdir -p "$dir"
   # The diff, and the tree reviewers may read for context (as the coordinator container sees it).
@@ -1010,29 +1180,54 @@ cmd_review() {
   elif [ -n "$env" ]; then
     env="$(cd "$env" && pwd)"; local wt="$env/$REPO_REL"
     [ -e "$wt/.git" ] || die "$wt is not a git checkout"
-    { git -C "$wt" diff HEAD 2>/dev/null || true
-      git -C "$wt" ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do git -C "$wt" diff --no-index -- /dev/null "$f" 2>/dev/null || true; done
-    } > "$dir/diff.patch"
+    tree_diff "$wt" > "$dir/diff.patch"
     case "$env" in "$PROJECT"/*) tree_c="$CONTAINER_ROOT/${env#"$PROJECT"/}/$REPO_REL" ;; *) tree_c="$CONTAINER_REPO" ;; esac
-    [ -n "$intent" ] || intent="Working tree of $env"
+    [ -n "$intent" ] || [ -n "$arena" ] || intent="Working tree of $env"
   else
     [ -f "$patch" ] || die "patch file not found: $patch"; cp "$patch" "$dir/diff.patch"; tree_c="$CONTAINER_REPO"
     [ -n "$intent" ] || intent="Patch $(basename "$patch")"
   fi
   [ -s "$dir/diff.patch" ] || die "empty diff: nothing to review"
   if [ -n "$env" ]; then changed_files "$env/$REPO_REL" > "$dir/tree-before.txt"; fi
-  printf '%s\n' "$intent" > "$dir/intent.txt"
+  # Reviewers of an environment work inside it, with its running site and database, when its
+  # AI containers are up; otherwise (and for a branch or a patch) from the coordinator.
+  local specs=() spec i=0 label labels=() prompt live=0 envn="" rdir="$dir" rcdir tree_r="$tree_c" runtime="$REVIEW_OFFLINE" where
+  rcdir="$CONTAINER_ROOT/${dir#"$PROJECT"/}"
+  IFS=',' read -r -a specs <<< "$reviewers"
+  if [ -n "$env" ]; then
+    envn="$(ddev_name "$env")"; live=1
+    for spec in ${specs[@]+"${specs[@]}"}; do
+      spec="$(printf '%s' "$spec" | tr -d '[:space:]')"; [ -n "$spec" ] || continue
+      container_running "$(container_for "${spec%%:*}" "${envn:-none}")" || live=0
+    done
+    if [ "$live" = 1 ]; then
+      rdir="$env/arena-review/$id"; rcdir="$CONTAINER_ROOT/arena-review/$id"; tree_r="$CONTAINER_ROOT/$REPO_REL"; runtime="$REVIEW_LIVE"
+      mkdir -p "$rdir"; cp "$dir/diff.patch" "$rdir/diff.patch"
+      log "reviewers run inside $envn, with its site and database"
+    else
+      warn "the AI containers of $env are not all running: reviewing from the coordinator, without the site (cd $env && ddev start for a live review)"
+    fi
+  fi
+  if [ -n "$arena" ]; then
+    local brief_c="$CONTAINER_ARENA/brief.md" note
+    [ "$live" = 0 ] || brief_c="$CONTAINER_ROOT/arena-brief.md"
+    note="Final code of arena $arena: the winning implementation plus what was ported from the others and the fixes the reviews asked for. The binding contract is $brief_c: check conformance with it besides correctness."
+    if [ -n "$prev" ] && [ -f "$prev/verdict.md" ]; then
+      cp "$prev/verdict.md" "$rdir/previous-verdict.md"; cp "$prev/diff.patch" "$rdir/previous-diff.patch" 2>/dev/null || true
+      note+=" This code was reviewed before and then fixed. The previous verdict is $rcdir/previous-verdict.md and the diff it read is $rcdir/previous-diff.patch. First check that every item under Act on is really fixed. Then review in depth what changed since (compare that diff with this one), and the rest only for what the fixes could have broken."
+    fi
+    intent="$note${intent:+ $intent}"
+  fi
+  printf '%s\n' "$intent" > "$dir/intent.txt"; [ "$rdir" = "$dir" ] || cp "$dir/intent.txt" "$rdir/intent.txt"
   log "review $id: $(grep -c '^diff --git' "$dir/diff.patch") file(s) in the diff"
   # Fan out the reviewers (labels r1, r2, ...) in parallel, each blind to the others.
-  local specs=() spec i=0 label labels=() cdir prompt
-  IFS=',' read -r -a specs <<< "$reviewers"
-  cdir="$CONTAINER_ROOT/${dir#"$PROJECT"/}"
   for spec in ${specs[@]+"${specs[@]}"}; do
     spec="$(printf '%s' "$spec" | tr -d '[:space:]')"; [ -n "$spec" ] || continue
     local harness="${spec%%:*}" model=""; [ "$spec" != "$harness" ] && model="${spec#*:}"; harness_user "$harness" >/dev/null
     i=$((i + 1)); label="r$i"; labels+=("$label")
-    prompt="$(sed -e "s|{{DIFF}}|$cdir/diff.patch|g" -e "s|{{INTENT}}|$cdir/intent.txt|g" -e "s|{{TREE}}|$tree_c|g" -e "s|{{OUT}}|$cdir/$label.md|g" "$PROMPTS_DIR/review.md")"
-    review_launch "$harness" "$model" "$label" "$dir" "$prompt"
+    where="$COORD"; [ "$live" = 0 ] || where="$envn"
+    prompt="$(review_prompt "$rcdir/diff.patch" "$rcdir/intent.txt" "$tree_r" "$rcdir/$label.md" "$runtime")"
+    review_launch "$(container_for "$harness" "$where")" "$harness" "$model" "$label" "$rdir" "$rcdir" "$prompt"
     jq -n --arg l "$label" --arg h "$harness" --arg m "$model" '{label:$l, harness:$h, model:(if $m=="" then null else $m end)}' >> "$dir/reviewers.jsonl"
   done
   [ "$i" -gt 0 ] || die "no reviewers"
@@ -1041,11 +1236,14 @@ cmd_review() {
   start="$(date +%s)"
   while :; do
     pending=0
-    for l in "${labels[@]}"; do [ -f "$dir/$l-run.exit" ] || pending=$((pending + 1)); done
+    for l in "${labels[@]}"; do [ -f "$rdir/$l-run.exit" ] || pending=$((pending + 1)); done
     [ "$pending" = "0" ] && break
-    if [ "$timeout" -gt 0 ] && [ $(( $(date +%s) - start )) -ge "$timeout" ]; then die "timeout: $pending reviewer(s) still running in $dir"; fi
+    if [ "$timeout" -gt 0 ] && [ $(( $(date +%s) - start )) -ge "$timeout" ]; then die "timeout: $pending reviewer(s) still running in $rdir"; fi
     sleep 10
   done
+  if [ "$rdir" != "$dir" ]; then
+    for l in "${labels[@]}"; do cp "$rdir/$l"-run.* "$dir/" 2>/dev/null || true; [ ! -f "$rdir/$l.md" ] || cp "$rdir/$l.md" "$dir/"; done
+  fi
   for l in "${labels[@]}"; do
     if [ ! -s "$dir/$l.md" ]; then
       local h; h="$(jq -r --arg l "$l" 'select(.label==$l) | .harness' "$dir/reviewers.jsonl" | head -n1)"
@@ -1072,6 +1270,8 @@ cmd_review() {
       undeclared_files "$dir/tree-after.txt" "$dir/tree-before.txt" >&2
     fi
   fi
+  [ -z "$arena" ] || mf_update --arg d "$dir" --arg h "$(tree_diff "$env/$REPO_REL" | sha256sum | cut -d' ' -f1)" --arg t "$(now)" \
+    '.reviews = ((.reviews // []) + [{dir:$d, diff_sha:$h, at:$t}])'
   echo "review: $dir"
   echo "reviewers: $(jq -r '[.label + "=" + .harness + ":" + (.model // "default")] | join(" ")' "$dir/reviewers.jsonl" | tr '\n' ' ')"
   echo "---"

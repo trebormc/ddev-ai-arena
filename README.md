@@ -121,60 +121,84 @@ candidate names); `ai-arena doctor` fails when they collide. Move your main envi
 ## Usage
 
 Open your host harness in the coordinator and say: "run an arena for: add a handling
-fee to the order total, three candidates". Or by hand:
+fee to the order total, three candidates". Or by hand. By default an arena runs in
+phases, and each phase compares and merges before the next one starts:
 
 ```bash
 ai-arena up
 ai-arena init "Add a handling fee" --candidates claude,opencode
-ai-arena plan add-a-handling-fee        # PM writes arena/<slug>/brief.md
-ai-arena spawn add-a-handling-fee       # worktree + DDEV + DB per candidate
-ai-arena run add-a-handling-fee         # detached
+ai-arena spawn add-a-handling-fee       # worktree + DDEV + DB per candidate: planners have a running site
+ai-arena draft add-a-handling-fee       # phase 1: each candidate writes its own plan
 ai-arena wait add-a-handling-fee --all
+ai-arena merge add-a-handling-fee       # PM picks one plan blind, improves it with the others
+ai-arena run add-a-handling-fee         # phase 2: all implement that brief, in the same sessions
+ai-arena wait add-a-handling-fee --all  # deadline for the slow ones; reviews start as each one finishes
 ai-arena gate add-a-handling-fee && ai-arena collect add-a-handling-fee
-ai-arena judge add-a-handling-fee       # blind, gates first
+ai-arena judge add-a-handling-fee       # blind, gates first, reads the reviews; writes grafts.md
 ai-arena promote add-a-handling-fee b --env
+ai-arena graft add-a-handling-fee       # phase 3: ports the grafts into worktree/, then gates
+ai-arena review --arena add-a-handling-fee   # double review inside worktree/, with the site
+ai-arena graft add-a-handling-fee --message "fix ..."   # Act-on items, then review --arena again
 ai-arena reveal add-a-handling-fee
 ai-arena compare add-a-handling-fee     # time, steps, tokens and cost per round, tests, gates
 ai-arena clean add-a-handling-fee
 ```
 
-### Planning in the candidates
+The result stays uncommitted in the `worktree/` environment for you to review. `reveal`
+names the label whose plan was the base.
 
-With `--plan-by candidates` (or `AI_ARENA_PLAN_BY=candidates`) the work runs in phases, and
-each phase compares and merges before the next one starts:
+Four rules keep it fast without losing what the comparison brings:
+
+- **Deadline.** The first candidate to finish a phase `DONE` sets it: every other one gets
+  `AI_ARENA_DEADLINE_FACTOR` (2) times that time, counted from its own start, and `wait`
+  stops it after that. A stopped candidate is marked `cut` and cannot win, but its work so
+  far is still collected: the judge reads it for anything worth porting into the winner.
+  In the planning phase, a cut plan can improve the merged brief but never be its base.
+- **Self-review first.** A candidate reviews its own diff with `code-review`, fixes what it
+  confirms and lists it under `SELF-REVIEW` in its report; a `DONE` report without it fails
+  the `report` gate. The cheapest fixes happen before anyone else reads the code.
+- **Double review with the site running.** As soon as a candidate finishes its
+  implementation, two reviews start inside its own environment, with its site and database:
+  `self`, a fresh session of its own harness and model, and `x1`..., the other candidates'
+  harnesses. They run tests, `drush` and the brief's live verification to confirm findings,
+  while the slower candidates still work. `judge` waits for them, reads them beside each
+  diff (`candidates/<label>/review-self.md`, `review-x1.md`), confirms or refutes each
+  finding, and lists the confirmed ones on the winner in `grafts.md` as fixes.
+- **The same double review on the final code.** `review --arena <slug>` runs it inside the
+  `worktree/` environment, against the brief, with a lead synthesis and an agreement map.
+  After a fix it checks the previous Act-on list and reviews what changed since, not the
+  whole diff again; `status` says whether the final code changed since its last review.
+  Reviewers never change code, config or modules; probe content carries the prefix
+  `arena-review-` and is deleted, and a file left in the tree is reported.
+
+### Planned by the PM
+
+`--plan-by pm` (or `AI_ARENA_PLAN_BY=pm`) is the flow before phases: one PM session
+investigates and writes the brief, and every candidate starts fresh on it. Approaches mode
+uses it unless `--plan-by` says otherwise. Deadline and candidate reviews work the same; there
+is no `grafts.md` and no `graft` step.
 
 ```bash
-ai-arena init "Add a handling fee" --plan-by candidates
-ai-arena spawn add-a-handling-fee       # environments first: planners have a running site
-ai-arena draft add-a-handling-fee       # phase 1: each candidate writes its own plan
-ai-arena wait add-a-handling-fee --all
-ai-arena merge add-a-handling-fee       # PM picks one plan blind, improves it with the others
-ai-arena run add-a-handling-fee         # phase 2: all implement that brief, in the same sessions
+ai-arena init "Add a handling fee" --plan-by pm
+ai-arena plan add-a-handling-fee        # PM writes arena/<slug>/brief.md
+ai-arena spawn add-a-handling-fee && ai-arena run add-a-handling-fee
 ai-arena wait add-a-handling-fee --all
 ai-arena gate add-a-handling-fee && ai-arena collect add-a-handling-fee
-ai-arena judge add-a-handling-fee       # winner, plus arena/<slug>/grafts.md
+ai-arena judge add-a-handling-fee
 ai-arena promote add-a-handling-fee b --env
-ai-arena graft add-a-handling-fee       # phase 3: ports the grafts into worktree/, then gates
-ai-arena reveal add-a-handling-fee
-ai-arena clean add-a-handling-fee
 ```
-
-The result stays uncommitted in the `worktree/` environment for you to review. `compare`
-shows the planning round apart from the implementation rounds, and `reveal` names the
-label whose plan was the base. It costs one investigation per candidate, and the phase
-lasts as long as the slowest planner. It does not combine with approaches mode.
 
 | Verb | What it does |
 |---|---|
 | `doctor` | Checks git, jq, ddev, docker, the layout, the coordinator's AI containers, the DB snapshot |
 | `up` | Starts the coordinator's containers |
 | `init "<task>" [--candidates ...] [--pm harness[:model]]` | Creates `arena/<slug>/manifest.json` |
-| `plan <slug>` | PM session runs `code-review` PLAN mode over `main/<repo>` and writes the brief |
-| `draft <slug> [label...]` | `--plan-by candidates`: each candidate investigates and writes `arena-plan.md`, changing nothing |
-| `merge <slug>` | `--plan-by candidates`: collects the plans under `arena/<slug>/plans/`; the PM picks one blind, improves it and writes the brief |
+| `plan <slug>` | `--plan-by pm` only: PM session runs `code-review` PLAN mode over `main/<repo>` and writes the brief |
+| `draft <slug> [label...]` | Phase 1: each candidate investigates and writes `arena-plan.md`, changing nothing |
+| `merge <slug>` | Ends phase 1: collects the plans under `arena/<slug>/plans/`; the PM picks one blind, improves it and writes the brief |
 | `spawn <slug> [label...]` | `worktree-add --tmp` per candidate: worktree, DDEV project, DB, composer, provisioning |
 | `run <slug> [label...]` | Starts candidates detached on the brief |
-| `wait <slug> [--all] [--timeout S] [--interval S]` | Blocks until a state change, with no timeout unless `--timeout S` or `AI_ARENA_WAIT_TIMEOUT` (poll every `--interval` seconds, default 15); prints JSON |
+| `wait <slug> [--all] [--timeout S] [--interval S]` | Blocks until a state change, with no timeout unless `--timeout S` or `AI_ARENA_WAIT_TIMEOUT` (poll every `--interval` seconds, default 15); prints JSON. Enforces the phase deadline and starts the reviews of each finished implementation inside its own environment |
 | `stop <slug> <label...>` | Kills a running candidate's harness (TERM, then KILL) and settles its state from the report it wrote; use it for a dead provider or a run that never exits |
 | `status <slug> [--json]` | Candidate states, gates, branches |
 | `resume <slug> <label> "<msg>"` | Continues a candidate's session (answers, new instructions) |
@@ -182,13 +206,13 @@ lasts as long as the slowest planner. It does not combine with approaches mode.
 | `gate <slug> [label...]` | Site bootstrap, config (unexported config changes fail unless the brief says `Config changes: allowed`), PHPStan, PHPCS, PHPUnit on changed custom modules, inside each candidate |
 | `collect <slug>` | Diffs, reports, gates into `arena/<slug>/candidates/` (no model info) |
 | `compare <slug> [--json]` | Time, steps, tokens and cost per round and in total, tests and failed gates, by label; flags candidates whose production code is identical. Each run and resume is one round, kept under `arena/<slug>/rounds/` |
-| `judge <slug>` | PM judges blind: gates, rubric, conformance, then quality |
+| `judge <slug>` | Waits for the candidate reviews, then the PM judges blind: gates, rubric, conformance, then quality; writes `grafts.md` in phased arenas |
 | `promote <slug> <label> [--branch] [--env] [--allow-undeclared]` | Refuses files the winner's report does not declare, then records the candidate's working tree as one commit on its `tmp/` branch (candidates never commit), then creates `feature/<slug>` from it; `--env` also creates its environment under `worktree/` |
 | `graft <slug> [--message "..."]` | Ports `arena/<slug>/grafts.md` into the `promote --env` environment with the winner's harness, then gates it. Blocks; commits nothing. `--message` continues that session |
 | `reveal <slug>` | Label → harness/model/agents with cost and duration, appends to the wins log |
 | `clean <slug> [--keep label] [--purge]` | Deletes candidates under `worktree-tmp/` and their `tmp/*` branches (the winner's too, once the promoted branch contains it); refuses when the judge picked a winner that was not promoted yet |
 | `list` | Arenas in this project |
-| `review (--branch <b> \| --env <dir> \| --patch <file>) [--reviewers a,b] [--intent "..."]` | Multi-model review of one diff: independent reviewers on different harnesses/models in the coordinator's containers, then a lead synthesis (act on / consider / noted / dismissed); no worktrees needed |
+| `review (--arena <slug> \| --branch <b> \| --env <dir> \| --patch <file>) [--reviewers a,b] [--intent "..."]` | Multi-model review of one diff: independent reviewers on different harnesses/models, then a lead synthesis (act on / consider / noted / dismissed). An environment is reviewed inside its own containers, with its site, when they run; a branch or a patch from the coordinator. `--arena` reviews the arena's final code with a fresh session of its author's harness plus the other candidates' harnesses and, after a fix, checks the previous Act-on list |
 
 ### Comparing approaches instead of models
 
@@ -281,7 +305,10 @@ coordinator's Playwright, a candidate's site is reachable at `http://ddev-<env_n
 `~/.ddev/ai-arena/config.env` (all projects, written by `install.sh`) and
 `<project>/ai-arena.env` (this project): candidate panel, PM harness and model, cap,
 review timeout (`AI_ARENA_TIMEOUT`), wait timeout (`AI_ARENA_WAIT_TIMEOUT`, `0` = wait
-forever, the default), database mode, base ref, extra local files, `AI_ARENA_MAIN_ENV`. Candidate
+forever, the default), database mode, base ref, extra local files, `AI_ARENA_MAIN_ENV`,
+who plans (`AI_ARENA_PLAN_BY`, `candidates` by default), the phase deadline
+(`AI_ARENA_DEADLINE_FACTOR`, `2`; `0` disables it), the candidate reviews (`AI_ARENA_CANDIDATE_REVIEWS`,
+`1`) and the review panel (`AI_ARENA_REVIEWERS`). Candidate
 models are applied through each environment's `.ddev/.env.agents` (the cascade
 `ddev-agents-sync` already honours) plus the harness's `--model` flag.
 

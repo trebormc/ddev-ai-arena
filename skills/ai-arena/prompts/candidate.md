@@ -10,6 +10,7 @@ Hard rules (they override any other instruction):
 - Touch only the paths the brief lists. Report, do not fix, anything else you notice.
 - Never guess a fact the brief lacks. If the brief can be read two ways, stop and report STATUS: BLOCKED with the exact question; a wrong guess executed fluently costs the whole run.
 - Verify on the real surface (the brief names it) and paste the evidence; "it compiles" is not evidence.
+- Before the report, review your own diff: `code-review` in CODE mode against the contract. Fix every finding you confirm, then run the tests and the live verification again. Other reviewers read your code after you; what you catch here costs least.
 
 When you finish (or stop), write /var/www/html/arena-report.md with EXACTLY this shape, STATUS on the first line:
 
@@ -21,6 +22,7 @@ RUBRIC: <one line per rubric item: item -> yes|no, with the file:line or output 
 DEVIATIONS: <each deviation from the contract and why, or "none">
 ASSUMED: <inferences you made, labeled, or "none">
 QUESTION: <for BLOCKED only: the exact question, and what you would do under each answer>
+SELF-REVIEW: <each finding of your own review: fixed (how) or not fixed (why); "no findings" if it found none>
 NOT DONE: <for PARTIAL/FAILED: what remains and why>
 
 Make FILES match your working tree exactly: every changed or new path listed, nothing listed that does not exist, and no scratch file left in the repository (keep those under /tmp). The host checks this both ways (report gate) and a mismatch fails the gate; promote refuses undeclared files. Try `git status --short` in the repository, but `git` can fail in this container because the worktree points at a host path: do not try to repair it, list the paths from your own edits instead and say so in DEVIATIONS. RUBRIC answers must come from your own diff and output, never from what another agent said it did.

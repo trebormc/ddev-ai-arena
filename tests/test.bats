@@ -668,7 +668,7 @@ git_arena() {
   export HOME_GIT=1
 }
 
-write_report() { printf 'STATUS: DONE\nFILES:\n%s\nEVIDENCE: x\n' "$1" > "$(dirname "$WT")/arena-report.md"; }
+write_report() { printf 'STATUS: DONE\nFILES:\n%s\nEVIDENCE: x\nSELF-REVIEW: no findings\n' "$1" > "$(dirname "$WT")/arena-report.md"; }
 
 # Answers like the containers of a phased arena: PM calls write the brief, the graft call its report.
 phased_docker() {
@@ -681,7 +681,7 @@ case "$1" in
     [ "$2" = "-d" ] && exit 0
     case "$*" in
       *ddev-base-arena-claude-code*) echo contract > "$STUB_BRIEF" ;;
-      *) printf 'STATUS: DONE\nFILES:\nfile.txt\nEVIDENCE: x\n' > "$STUB_ENV/arena-report.md" ;;
+      *) printf 'STATUS: DONE\nFILES:\nfile.txt\nEVIDENCE: x\nSELF-REVIEW: no findings\n' > "$STUB_ENV/arena-report.md" ;;
     esac
     printf '{"type":"result","session_id":"s9","result":"VERDICT: DONE\\nTO: none\\nWINNER: a\\nMESSAGE: ok"}\n' ;;
 esac
@@ -693,12 +693,12 @@ EOF
   jq '.plan_by = "candidates" | .candidates[0].state = "DONE" | .candidates[0].session = "s1"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
 }
 
-@test "init records --plan-by, refuses bad values and approaches, and each flow rejects the other's verbs" {
+@test "init plans in the candidates by default, approaches keep the PM, and each flow rejects the other's verbs" {
   set -eu -o pipefail
   stub_tools
   local coord
   coord="$(make_coordinator coord-arena mysite repo)"
-  run "$SCRIPTS/ai-arena" --project "$coord" init "Staged task" --plan-by candidates
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Staged task"
   assert_success
   run jq -r '.plan_by' "$coord/arena/staged-task/manifest.json"
   assert_output "candidates"
@@ -715,7 +715,12 @@ EOF
   assert_failure
   assert_output --partial "does not combine"
 
-  run "$SCRIPTS/ai-arena" --project "$coord" init "Plain task"
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Two designs" --approach "x" --approach "y"
+  assert_success
+  run jq -r '.plan_by' "$coord/arena/two-designs/manifest.json"
+  assert_output "pm"
+
+  run "$SCRIPTS/ai-arena" --project "$coord" init "Plain task" --plan-by pm
   assert_success
   run "$SCRIPTS/ai-arena" --project "$coord" draft plain-task
   assert_failure
@@ -813,6 +818,152 @@ EOF
   printf '\n  \n' > "$TESTDIR/g"; run grafts_empty "$TESTDIR/g"; assert_success
   printf 'None.\n' > "$TESTDIR/g"; run grafts_empty "$TESTDIR/g"; assert_success
   printf 'none\nport X from b\n' > "$TESTDIR/g"; run grafts_empty "$TESTDIR/g"; assert_failure
+}
+
+@test "cli: the first DONE of a phase sets the deadline, later ones and other states do not" {
+  set -eu -o pipefail
+  arena_fixture claude
+  eval "$(cli_functions deadline_note)"
+  local m="$MANIFEST"
+  jq '.status = "running" | .candidates[0].rounds = [{duration_s:600}] | .candidates += [{label:"b", rounds:[{duration_s:900}]}]' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  AI_ARENA_DEADLINE_FACTOR=2
+  deadline_note a BLOCKED 2>/dev/null
+  run jq -c '.deadline' "$m"; assert_output "null"
+  deadline_note a DONE 2>/dev/null
+  deadline_note b DONE 2>/dev/null
+  run jq -c '.deadline' "$m"
+  assert_output '{"phase":"running","label":"a","first_s":600,"factor":2,"limit_s":1200}'
+  # A new phase gets its own deadline; factor 0 disables it.
+  jq '.status = "drafting"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  AI_ARENA_DEADLINE_FACTOR=0; deadline_note b DONE 2>/dev/null
+  run jq -r '.deadline.phase' "$m"; assert_output "running"
+  AI_ARENA_DEADLINE_FACTOR=1.5; deadline_note b DONE 2>/dev/null
+  run jq -c '[.deadline.phase, .deadline.limit_s]' "$m"; assert_output '["drafting",1350]'
+}
+
+@test "wait stops a candidate past the deadline, marks it cut and the judge is told" {
+  set -eu -o pipefail
+  git_arena
+  phased_docker
+  local m="$COORD_DIR/arena/x/manifest.json" benv="$COORD_DIR/worktree-tmp/base-tmp-x-b"
+  mkdir -p "$benv" "$COORD_DIR/arena/x/candidates/b"
+  jq --arg d "$benv" --arg s "$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)" '.status = "running"
+    | .deadline = {phase:"running", label:"a", first_s:600, factor:2, limit_s:1200}
+    | .candidates += [{label:"b", harness:"opencode", branch:"tmp/x-b", env_name:"base-tmp-x-b", env_dir:$d, state:"running", started:$s}]' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" wait x --all --interval 1
+  assert_success
+  assert_output --partial "past the deadline of 1200s"
+  run jq -r '.candidates[1] | "\(.state):\(.cut):\(.exit_code)"' "$m"
+  assert_output "FAILED:true:143"
+
+  printf 'STATUS: DONE\n' > "$COORD_DIR/arena/x/candidates/a/report.md"
+  printf 'STATUS: FAILED\n' > "$COORD_DIR/arena/x/candidates/b/report.md"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" judge x
+  assert_success
+  run cat $(ls "$COORD_DIR"/arena/x/pm/prompt-*.txt | tail -n1)
+  assert_output --partial "STOPPED AT THE DEADLINE: b ran past 2x"
+  assert_output --partial "GRAFTS:"
+}
+
+@test "cli: cross-reviewers are the other candidates' harnesses, never the author's" {
+  set -eu -o pipefail
+  arena_fixture claude
+  eval "$(cli_functions xreviewers_for)"
+  jq '.candidates += [{label:"b", harness:"opencode", model:null}, {label:"c", harness:"claude", model:"sonnet"}]' "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+  run xreviewers_for a; assert_output "opencode:"
+  run xreviewers_for b; assert_output $'claude:\nclaude:sonnet'
+}
+
+@test "a finished implementation gets a fresh self-review and a cross-review inside its own environment" {
+  set -eu -o pipefail
+  git_arena
+  phased_docker
+  printf '%s\n' ddev-base-arena-claude-code ddev-base-tmp-x-a-claude-code ddev-base-tmp-x-a-opencode > "$TESTDIR/ps"
+  sed -i 's|  ps) printf .*|  ps) cat "$STUB_PS" ;;|' "$TESTDIR/bin/docker"
+  export STUB_PS="$TESTDIR/ps"
+  local m="$COORD_DIR/arena/x/manifest.json" env; env="$(dirname "$WT")"
+  echo changed > "$WT/file.txt"
+  write_report file.txt
+  echo 0 > "$env/arena-run.exit"
+  jq --arg s "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.status = "running" | .candidates[0].state = "running" | .candidates[0].started = $s | .candidates[0].model = "opus"
+    | .candidates += [{label:"b", harness:"opencode", branch:"tmp/x-b", env_name:"base-tmp-x-b", env_dir:"/none", state:"FAILED"}]' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  : > "$STUB_LOG"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" wait x
+  assert_success
+  run cat "$STUB_LOG"
+  assert_output --partial "ddev-base-tmp-x-a-claude-code"
+  assert_output --partial "ddev-base-tmp-x-a-opencode"
+  refute_output --partial "ddev-base-arena-"
+  run jq -c '.candidates[0].reviewers' "$m"
+  assert_output '[{"label":"self","harness":"claude","model":"opus"},{"label":"x1","harness":"opencode","model":null}]'
+  # Fresh sessions: no --resume of the candidate's own session.
+  run grep -c -- '--resume' "$STUB_LOG"
+  assert_output "0"
+  run cat "$env/arena-review/x1-prompt.txt"
+  assert_output --partial "/var/www/html/arena-review/diff.patch"
+  assert_output --partial "/var/www/html/app"
+  assert_output --partial "runs the site of the code under review"
+  run cat "$env/arena-review/intent.txt"
+  assert_output --partial "/var/www/html/arena-brief.md"
+
+  for r in self x1; do echo "## Verdict $r" > "$env/arena-review/$r.md"; echo 0 > "$env/arena-review/$r-run.exit"; done
+  echo junk > "$WT/probe.txt"
+  mkdir -p "$COORD_DIR/arena/x/candidates/b"; printf 'STATUS: FAILED\n' > "$COORD_DIR/arena/x/candidates/b/report.md"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" judge x
+  assert_success
+  assert_output --partial "a reviewer of a left files in its tree"
+  run cat "$COORD_DIR/arena/x/candidates/a/review-x1.md"
+  assert_output "## Verdict x1"
+  run cat $(ls "$COORD_DIR"/arena/x/pm/prompt-*.txt | tail -n1)
+  assert_output --partial "REVIEWS: each candidate reviewed and fixed its own diff"
+  refute_output --partial "STOPPED AT THE DEADLINE"
+}
+
+@test "review --arena runs the author's harness fresh and the others inside the final environment, and re-reviews the fixes" {
+  set -eu -o pipefail
+  git_arena
+  phased_docker
+  printf '%s\n' ddev-base-arena-claude-code > "$TESTDIR/ps"
+  sed -i 's|  ps) printf .*|  ps) cat "$STUB_PS" ;;|' "$TESTDIR/bin/docker"
+  export STUB_PS="$TESTDIR/ps"
+  local m="$COORD_DIR/arena/x/manifest.json" env="$COORD_DIR/worktree/base-feature-x" prev="$COORD_DIR/arena/reviews/review-old"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" review --arena x
+  assert_failure
+  assert_output --partial "no promoted environment"
+
+  mkdir -p "$env/.ddev" "$prev"; echo "## Act on" > "$prev/verdict.md"; echo old > "$prev/diff.patch"
+  printf 'name: base-feature-x\ntype: drupal\n' > "$env/.ddev/config.yaml"
+  echo contract > "$COORD_DIR/arena/x/brief.md"
+  git -C "$REPO" worktree add -q -b feature/x "$env/app"
+  echo changed > "$env/app/file.txt"
+  jq --arg d "$env" --arg p "$prev" '.winner = {label:"a", branch:"feature/x", env_dir:$d} | .final = {label:"final", harness:"claude", model:"opus", env_dir:$d}
+    | .candidates += [{label:"b", harness:"opencode", model:null, branch:"tmp/x-b", env_dir:"/none", state:"DONE"}]
+    | .reviews = [{dir:$p, diff_sha:"old"}]' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" status x
+  assert_output --partial "final code: changed since the last review"
+
+  # Environment containers down: the review falls back to the coordinator and says so.
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" review --arena x --reviewers claude --timeout 1
+  assert_output --partial "reviewing from the coordinator, without the site"
+
+  printf '%s\n' ddev-base-arena-claude-code ddev-base-feature-x-claude-code ddev-base-feature-x-opencode > "$TESTDIR/ps"
+  : > "$STUB_LOG"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" review --arena x --timeout 1
+  assert_failure
+  assert_output --partial "reviewers run inside base-feature-x"
+  run cat "$STUB_LOG"
+  assert_output --partial "ddev-base-feature-x-claude-code"
+  assert_output --partial "ddev-base-feature-x-opencode"
+  assert_output --partial "--model opus"
+  refute_output --partial "--resume"
+  local rd; rd="$(ls -d "$env"/arena-review/review-2* | tail -n1)"
+  run cat "$rd/intent.txt"
+  assert_output --partial "/var/www/html/arena-brief.md"
+  assert_output --partial "/var/www/html/arena-review/$(basename "$rd")/previous-verdict.md"
+  run cat "$rd/previous-verdict.md"
+  assert_output "## Act on"
+  run cat "$env/arena-brief.md"
+  assert_output "contract"
 }
 
 @test "promote refuses files the report does not declare and --allow-undeclared overrides it" {
@@ -999,6 +1150,14 @@ make_skill() { # repo name
   run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
   run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
   assert_output "pass"
+
+  # DONE without the candidate's own review fails.
+  printf 'STATUS: DONE\nFILES:\nfile.txt\nEVIDENCE: x\n' > "$(dirname "$WT")/arena-report.md"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" gate x a
+  run jq -r .report "$COORD_DIR/arena/x/candidates/a/gates.json"
+  assert_output "fail"
+  run cat "$COORD_DIR/arena/x/candidates/a/gates/report.log"
+  assert_output --partial "STATUS DONE without SELF-REVIEW"
 }
 
 @test "worktree-remove refuses uncommitted changes before touching DDEV, -f still removes" {

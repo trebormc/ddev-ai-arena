@@ -11,7 +11,7 @@ description: >-
   questions upward only when a human must decide, and report the result. Also owns
   the worktree-add and worktree-remove scripts for ordinary branch environments.
   Examples:
-  - user: "lanza una arena para añadir la tasa de gestión al total, tres candidatos" -> up, init, plan, spawn, run, wait loop, judge, promote, reveal, clean
+  - user: "lanza una arena para añadir la tasa de gestión al total, tres candidatos" -> up, init, spawn, draft, merge, run, wait loop, judge, promote --env, graft, review --arena, reveal, clean
   - user: "arena this task with claude:opus and opencode" -> same with --candidates
   - user: "¿cómo va la arena?" -> ai-arena status, summarise
   - user: "crea un entorno para la rama feature/DREP-123" -> worktree-add feature/DREP-123
@@ -48,56 +48,55 @@ Everything mechanical is a verb of `ai-arena`; everything that needs Drupal judg
 happens inside AI containers through `plan`, `pm`, and `judge`. You decide which verb
 comes next and read JSON. `ai-arena status <slug> --json` is the source of truth.
 
-## Planning in the candidates
-
-When the user asks for each harness to plan, or for phases ("que planifique cada arnés",
-"fase de planificación"), add `--plan-by candidates` to `init`. Steps 3 to 5 become:
-
-- `ai-arena spawn <slug>`, then `ai-arena draft <slug>` and the wait loop of step 6. Each
-  candidate writes a plan and changes nothing. A `BLOCKED` planner has no PM behind it yet:
-  put its question to the user and `resume` it.
-- `ai-arena merge <slug>`, in the background. The PM picks one plan blind, improves it with
-  the others and writes the brief. Read the brief as in step 3; `ASK_USER` works the same.
-- `ai-arena run <slug>`: the candidates continue their sessions on the merged brief.
-
-Steps 6 to 8 stay. `judge` also writes `arena/<slug>/grafts.md`, so step 9 changes order:
-`ai-arena promote <slug> <winner> --env`, then `ai-arena graft <slug>` in the background (it
-blocks, then gates the environment under `worktree/`), then `ai-arena review --env
-<that environment>`; send Act-on items with `ai-arena graft <slug> --message "..."`.
-Nothing there is committed: the user reviews and commits it.
-
 ## The run
+
+By default an arena runs in phases: every candidate plans, the PM merges the plans into one
+brief, every candidate implements it and reviews and fixes its own diff, then each
+implementation gets two more reviews in its own running site (a fresh session of its own
+harness and the other harnesses), the judge picks the winner and lists what to port and fix,
+the winner's harness does it in a real environment, and the same double review runs there
+until nothing is left to act on. Arenas made with
+`--plan-by pm` or in approaches mode keep the single PM plan (see the end of this section).
 
 1. **Bring up layer 2.** `ai-arena doctor`, then `ai-arena up` if the coordinator's
    containers are not running. Fix or report what doctor flags.
 2. **Init.** `ai-arena init "<task in the user's words>" [--candidates claude,opencode] [--description "..."]`.
    Prints the slug. To evaluate a change to the agents pack, pin the agents repo per
    candidate with `@<branch>` (same model, same task: `claude:sonnet@main,claude:sonnet@feature/x`). Default panel and cap (max 3) come from `ai-arena.env`. Different
-   harnesses and models per label are the point: keep the panel diverse unless the
-   user names one.
-   **Approaches mode** (the user wants to compare designs, not models: "misma tarea
-   con dos enfoques", "compare approach X vs Y"): same model for every label, usually
-   `--candidates opencode,opencode`, plus either `--approach "<text>"` once per label in
-   order (the user dictates them) or `--approaches` (the PM proposes one per label in
-   `plan` and replies `ASK_USER` with the list: put it to the user, send changes with
-   `ai-arena pm <slug> "..."`, spawn only once the user confirms). Approaches live in
-   `arena/<slug>/approach-<label>.md`; `status`, `reveal` and the judge show them.
-3. **Plan.** `ai-arena plan <slug>`, in the background: it often takes over 20 minutes and a foreground call hits the tool timeout. The PM session (coordinator container) runs
-   `code-review` in PLAN mode over `main/<repo>` and writes `arena/<slug>/brief.md`.
-   Read the brief. It must fix outcomes, interfaces and tests, not implementation bodies; a contract that dictates the code makes every candidate deliver the same thing, so send it back with `ai-arena pm`. Do the same with any line `plan` warns about: those commands fail in the candidates' containers. On `VERDICT: ASK_USER`, put the question to the user, then
-   `ai-arena pm <slug> "<answer>"` and ask it to write the brief. Do not spawn without
-   a brief.
-4. **Bring up layer 3.** `ai-arena spawn <slug>`. For each candidate, `worktree-add
+   harnesses per label are the point: the cross review needs at least two, so keep the panel
+   diverse unless the user names one.
+3. **Bring up layer 3.** `ai-arena spawn <slug>`. For each candidate, `worktree-add
    --tmp` copies the main environment, creates the worktree on `tmp/<slug>-<label>`,
    starts its DDEV project `<base>-tmp-<slug>-<label>`, provisions the database
    (baseline snapshot, newest `backups/` dump, or an export of main) and runs composer
    and drush. Minutes per candidate; run it in the background and keep the user
    informed. A failed spawn for one label is not fatal: report it, continue.
-5. **Run.** `ai-arena run <slug>`. Detached; candidates keep working even if this
-   session ends.
-6. **Wait loop.** `ai-arena wait <slug>` blocks until any candidate changes state
+4. **Plan.** `ai-arena draft <slug>`, then the wait loop (step 7) until no planner is
+   `running`. Each candidate investigates its own copy and writes a plan; it changes
+   nothing. A `BLOCKED` planner has no PM behind it yet: put its question to the user and
+   `resume` it.
+5. **Merge.** `ai-arena merge <slug>`, in the background (it can take 20 minutes). The PM
+   picks one plan blind, improves it with the others and writes `arena/<slug>/brief.md`.
+   Read the brief. It must fix outcomes, interfaces and tests, not implementation bodies; a
+   contract that dictates the code makes every candidate deliver the same thing, so send it
+   back with `ai-arena pm`. Do the same with any line `merge` warns about: those commands
+   fail in the candidates' containers. On `VERDICT: ASK_USER`, put the question to the user,
+   then `ai-arena pm <slug> "<answer>"` and ask it to write the brief.
+6. **Run.** `ai-arena run <slug>`: each candidate continues its planning session on the
+   merged brief. Detached; candidates keep working even if this session ends.
+7. **Wait loop.** `ai-arena wait <slug>` blocks until any candidate changes state
    (`--all` for all; no timeout unless `--timeout S`). Run it in the background and react:
-   - `DONE` → keep waiting for the rest.
+   - `DONE` → keep waiting for the rest. The first `DONE` of a phase sets the **deadline**:
+     every other candidate gets `AI_ARENA_DEADLINE_FACTOR` (default 2) times that time from
+     its own start, and `wait` stops it after that. A stopped candidate is marked `cut`;
+     its work so far is still collected, and the judge reads it for grafts (it cannot win).
+     Tell the user when a candidate is cut.
+   - In the implementation phase each candidate has already reviewed and fixed its own diff
+     (its report must carry `SELF-REVIEW`, or the `report` gate fails). Each `DONE` or
+     `PARTIAL` one then gets **two reviews at once, inside its own environment with its site
+     and database**: `self`, a fresh session of its own harness and model, and `x1`..., the
+     other candidates' harnesses. They run while the slower candidates keep working; their
+     files are under `worktree-tmp/<env_name>/arena-review/`. Nothing to do: `judge` waits.
    - `BLOCKED` → relay to the PM: `ai-arena pm <slug> "Candidate <label> is BLOCKED,
      see worktree-tmp/<env_name>/arena-report.md"`. On `VERDICT: ANSWER` or
      `REDISPATCH`, `ai-arena resume <slug> <label> "<MESSAGE>"` (for `TO: all`, resume
@@ -111,39 +110,66 @@ Nothing there is committed: the user reviews and commits it.
      from the report; gate and judge it like any other finished candidate.
    - `PARTIAL` → treat like DONE for gating; the judge weighs it.
    Repeat until no candidate is `running`.
-7. **Gate and collect.** `ai-arena gate <slug>` then `ai-arena collect <slug>`. Gates
+8. **Gate and collect.** `ai-arena gate <slug>` then `ai-arena collect <slug>`. Gates
    are mechanical (site bootstrap, config, PHPStan, PHPCS, PHPUnit on the changed custom
    modules, and `report`: the report's FILES and the changed files match both ways), inside
    each candidate's own project. A `report` failure usually means a stray file: read
    `candidates/<label>/gates/report.log` and resume the candidate. Report the gate table to
    the user before judging. If `collect` warns that the production code is identical, tell
    the user: the arena measured discipline, not design.
-8. **Judge.** `ai-arena judge <slug>`. Blind: the PM sees labels and collected copies
-   only. Read the ranking and graft suggestions. On `VERDICT: BLOCKED` (no acceptable
-   candidate), report why and ask the user whether to resume the best one with the
-   PM's instructions or stop.
-9. **Review the winner (default step; skip only for trivial diffs).**
-   `ai-arena review --env worktree-tmp/<winner env_name> --intent "<task>"` runs the
-   multi-model panel on the winner's working tree before it becomes a branch. In every
-   arena so far the panel found defects the rubric could not express (per-entity
-   authorization, REST contract regressions, data corruption). Resume the winner with the
-   Act-on items (`ai-arena resume <slug> <winner> "..."`), re-gate, and only then promote;
-   put Consider items that are product calls to the user. A resume is a new round: tell
-   the user that later rounds improve the winner and are not part of the comparison.
-10. **Promote and reveal.** `ai-arena promote <slug> <winner> [--env]` creates
-   `feature/<slug>` in the main repository (with `--env`, also its environment under
-   `worktree/`). It refuses files the report does not declare: remove them through a
-   resume, or pass `--allow-undeclared` only when they belong. Then `ai-arena reveal <slug>`
-   shows which harness and model each label was and logs the win to
-   `~/.ddev/ai-arena/wins.tsv`, and `ai-arena compare <slug>` prints time, steps, tokens and
-   cost per round plus tests and gates: use it for the comparison table you report.
-11. **Clean.** `ai-arena clean <slug>` removes the candidates under `worktree-tmp/`
+9. **Judge.** `ai-arena judge <slug>`, in the background. It first waits for the
+   candidate reviews and puts them beside each diff (`review-self.md`, `review-x1.md`); it
+   warns if a reviewer left files in a tree. Blind: the PM sees labels and collected copies
+   only. It ranks, confirms or refutes each review finding, and writes
+   `arena/<slug>/grafts.md`: what to port from the losers, cut ones included, and the
+   confirmed findings on the winner to fix. On
+   `VERDICT: BLOCKED` (no acceptable candidate), report why and ask the user whether to
+   resume the best one with the PM's instructions or stop.
+10. **Promote and graft.** `ai-arena promote <slug> <winner> --env` creates
+   `feature/<slug>` and its environment under `worktree/`. It refuses files the report
+   does not declare: remove them through a resume, or pass `--allow-undeclared` only when
+   they belong. Then `ai-arena graft <slug>` in the background: the winner's harness ports
+   the list into that environment, then it is gated. Pass the confirmed review
+   findings on the winner with `ai-arena graft <slug> --message "..."` if the list did not
+   cover them. Nothing there is committed: the user reviews and commits it.
+11. **Final review (always).** `ai-arena review --arena <slug>`, in the background: inside
+   the environment under `worktree/`, with its site, a fresh session of the harness that
+   wrote the final code and the other candidates' harnesses review it in parallel against
+   the brief, and a lead synthesises them with an agreement map. If that environment's AI
+   containers are down it warns and reviews without the site: start it first. Send the
+   Act-on items with `ai-arena graft <slug> --message "..."`, then run `review --arena`
+   again: it checks those items and reviews what changed since, not the whole diff again.
+   Stop when the verdict has no Act-on items; `ai-arena status <slug>` says whether the
+   final code changed since its last review. Put Consider items that are product calls to
+   the user.
+12. **Reveal and compare.** `ai-arena reveal <slug>` shows which harness and model each
+   label was and logs the win to `~/.ddev/ai-arena/wins.tsv`; `ai-arena compare <slug>`
+   prints time, steps, tokens and cost per round plus tests and gates: use it for the
+   comparison table you report, and say which candidates were cut.
+13. **Clean.** `ai-arena clean <slug>` removes the candidates under `worktree-tmp/`
     and their `tmp/*` branches (the winner's too, once `feature/<slug>` contains it). Ask the user only if a
     candidate is still running or they asked to keep losers.
 
+### Arenas planned by the PM
+
+`init --plan-by pm` (or `AI_ARENA_PLAN_BY=pm`), and approaches mode by default, skip steps 4
+and 5: after `init`, `ai-arena plan <slug>` in the background (the PM runs `code-review` in
+PLAN mode over `main/<repo>` and writes the brief; read it as in step 5), then `spawn` and
+`run`, which start every candidate fresh. Deadline and candidate reviews work the same. The judge
+writes no `grafts.md`: review the winner with `ai-arena review --env worktree-tmp/<winner
+env_name> --intent "<task>"`, resume it with the Act-on items, re-gate, then `promote`.
+
+**Approaches mode** (the user wants to compare designs, not models: "misma tarea con dos
+enfoques", "compare approach X vs Y"): same model for every label, usually `--candidates
+opencode,opencode`, plus either `--approach "<text>"` once per label in order (the user
+dictates them) or `--approaches` (the PM proposes one per label in `plan` and replies
+`ASK_USER` with the list: put it to the user, send changes with `ai-arena pm <slug> "..."`,
+spawn only once the user confirms). Approaches live in `arena/<slug>/approach-<label>.md`;
+`status`, `reveal` and the judge show them. With one harness only the `self` review runs.
+
 ## Multi-model review (no arena)
 
-`ai-arena review --branch <b> | --env <dir> | --patch <file> [--reviewers claude:opus,opencode] [--intent "..."]`
+`ai-arena review --arena <slug> | --branch <b> | --env <dir> | --patch <file> [--reviewers claude:opus,opencode] [--intent "..."]`
 runs independent reviewers on different harnesses and models in the coordinator's
 containers and a lead synthesis; it prints the verdict and leaves everything under
 `arena/reviews/<id>/`. Use it when the user asks for a review, a second opinion, or
@@ -165,7 +191,8 @@ first, then Consider, and name which reviews agreed.
 ## Reporting to the user
 
 Answer first: winner, why (gates + rubric), what the losers had that was grafted or
-worth grafting, the `feature/<slug>` branch, and what the user does next (review the
+worth grafting, which candidates were cut at the deadline, what the reviews and the
+final review found and whether it is fixed, the `feature/<slug>` branch, and what the user does next (review the
 diff, commit, open the PR: you never commit). Then the run facts: candidates, time,
 anything skipped. Keep model names out of the judgment narrative until reveal.
 

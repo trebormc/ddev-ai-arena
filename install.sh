@@ -83,8 +83,17 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 # Reviewer panel for `ai-arena review`: comma-separated "harness[:model]".
 #AI_ARENA_REVIEWERS=claude:opus,opencode
 
-# Who plans a new arena: pm (one shared plan) or candidates (one plan each, then merged).
-#AI_ARENA_PLAN_BY=pm
+# Who plans a new arena: candidates (one plan each, merged by the PM; the default) or pm
+# (one shared plan, the flow before phases). Approaches mode uses pm unless --plan-by says otherwise.
+#AI_ARENA_PLAN_BY=candidates
+
+# Once one candidate finishes a phase, the others get this many times its time, then are
+# stopped and judged on what they did (0 disables the deadline).
+#AI_ARENA_DEADLINE_FACTOR=2
+
+# Each finished implementation is reviewed in its own environment by a fresh session of its
+# harness and by the other candidates' harnesses (0 disables).
+#AI_ARENA_CANDIDATE_REVIEWS=1
 
 # Repository a candidate's short "@<branch>" agents pin refers to.
 #AI_ARENA_AGENTS_REPO=https://github.com/trebormc/drupal-ai-agents.git
