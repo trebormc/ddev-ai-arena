@@ -73,7 +73,7 @@ Usage: ai-arena [--project <dir>] <command> [args]      (default project: curren
                                            per label (usually the same model for all, e.g.
                                            --candidates opencode,opencode). --approach "text"
                                            (one per label, in order) dictates them; --approaches
-                                           lets the PM propose them in `plan` for your confirmation
+                                           lets the PM propose them in "plan" for your confirmation
   plan <slug> ["description"]              PM session writes arena/<slug>/brief.md
   draft <slug> [label...]                  --plan-by candidates: each candidate writes its own plan
   merge <slug>                             --plan-by candidates: PM picks the best plan, improves it
