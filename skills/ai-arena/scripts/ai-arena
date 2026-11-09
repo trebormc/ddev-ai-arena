@@ -48,6 +48,9 @@ AI_ARENA_CANDIDATE_REVIEWS=1
 # (space or comma separated). OpenCode compacts a long planning context early and can fail
 # when a compaction does not fit; a fresh session reads its own plan file instead.
 AI_ARENA_RUN_FRESH="opencode"
+# Automatic continues per candidate and phase when a harness ends cleanly (exit 0) without a
+# report: after an automatic compaction a model can take the summary for an order to stop.
+AI_ARENA_AUTO_CONTINUE=1
 AI_ARENA_AGENTS_REPO="https://github.com/trebormc/drupal-ai-agents.git"
 
 log()  { printf '==> %s\n' "$*" >&2; }
@@ -387,6 +390,23 @@ record_round() { # label harness exit_code status
       | .cost_usd = ([.rounds[].cost_usd | select(. != null)] as $c | if ($c | length) > 0 then ($c | add) else null end))'
 }
 
+# A harness that exits 0 with no report stopped by itself (seen in OpenCode right after an
+# automatic compaction: "the user is telling me to stop"). Continue its session instead of
+# failing it, up to AI_ARENA_AUTO_CONTINUE times per phase. Stops and deadline cuts exit non-zero.
+auto_continue() { # label exit_code session -> 0 if relaunched
+  local label="$1" phase n
+  [ "$2" = 0 ] && [ -n "$3" ] || return 1
+  phase="$(mf_get '.status')"; case "$phase" in drafting|running) ;; *) return 1 ;; esac
+  [ "$(cand_get "$label" '.cut // false')" != true ] || return 1
+  n="$(cand_get "$label" ".auto_continues.$phase // 0")"
+  [ "$n" -lt "${AI_ARENA_AUTO_CONTINUE:-0}" ] || return 1
+  [ -d "$(cand_get "$label" '.env_dir')" ] && container_running "$(container_for "$(cand_get "$label" '.harness')" "$(cand_get "$label" '.env_name')")" || return 1
+  record_round "$label" "$(cand_get "$label" '.harness')" "$2" STOPPED
+  mf_update --arg l "$label" --arg p "$phase" '(.candidates[] | select(.label==$l)).auto_continues[$p] |= ((. // 0) + 1)'
+  warn "candidate $label ended without a report: continuing its session ($((n + 1))/$AI_ARENA_AUTO_CONTINUE)"
+  launch_candidate "$label" "Nobody asked you to stop: the run ended without a report, probably after an automatic context compaction. Continue the task from where you were, finish it as your instructions say and write $CONTAINER_ROOT/arena-report.md (STATUS first line)." 1
+}
+
 settle_candidate() { # label -> prints new state
   local label="$1" env_dir harness exit_code report status="" session
   env_dir="$(cand_get "$label" '.env_dir')"; harness="$(cand_get "$label" '.harness')"
@@ -395,6 +415,7 @@ settle_candidate() { # label -> prints new state
   session="$(session_from_output "$harness" "$env_dir/arena-run.json")"; [ -n "$session" ] && cand_set "$label" session "$session"
   report="$env_dir/arena-report.md"
   if [ -f "$report" ]; then status="$( { grep -E '^STATUS:' "$report" || true; } | head -n1 | sed -E 's/^STATUS:[[:space:]]*//' | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"; fi
+  if [ ! -f "$report" ] && auto_continue "$label" "$exit_code" "$session"; then echo running; return 0; fi
   case "$status" in DONE|BLOCKED|FAILED|PARTIAL) ;; *) status="FAILED" ;; esac
   cand_set "$label" state "$status"; cand_set "$label" exit_code "$exit_code"
   record_round "$label" "$harness" "$exit_code" "$status"
@@ -572,6 +593,10 @@ phpunit_totals() { # gates_dir -> {tests,assertions,failures,errors} summed over
   if [ "$seen" = "1" ]; then printf '{"tests":%s,"assertions":%s,"failures":%s,"errors":%s}' "$t" "$a" "$fa" "$e"; else echo null; fi
 }
 
+pending_config() { # env_dir logfile -> number of config items that differ from config/sync, "?" if unknown, empty if nothing came back
+  (cd "$1" && ddev drush config:status --format=json 2>"$2") | jq -r 'if type=="array" then length elif type=="object" then (keys | length) else 0 end' 2>/dev/null || echo "?"
+}
+
 run_gate() { # env_dir container_dir logfile cmd... -> pass|fail
   local env="$1" cdir="$2" logf="$3"; shift 3
   if (cd "$env" && ddev exec -d "$cdir" "$@") > "$logf" 2>&1; then echo pass; else echo fail; fi
@@ -585,7 +610,7 @@ gate_candidate() { # label
   site="fail"; (cd "$env_dir" && ddev drush status --field=bootstrap) 2>"$gdir/site.log" | grep -q Successful && site="pass"
   # Config gate: unexported config changes fail unless the brief allows them.
   local config="skip" pending
-  pending="$( (cd "$env_dir" && ddev drush config:status --format=json 2>"$gdir/config.log") | jq -r 'if type=="array" then length elif type=="object" then (keys | length) else 0 end' 2>/dev/null || echo "?")"
+  pending="$(pending_config "$env_dir" "$gdir/config.log")"
   if [ "$pending" = "0" ]; then config="pass"
   elif [ "$pending" = "?" ] || [ -z "$pending" ]; then config="skip"
   elif grep -qiE '^[-* ]*config changes:[[:space:]]*allowed' "$ARENA_DIR/brief.md" 2>/dev/null; then config="pass"; printf 'pending config changes: %s (allowed by the brief)\n' "$pending" >> "$gdir/config.log"
@@ -800,12 +825,15 @@ cmd_draft() { # phase 1: every candidate investigates and writes its own plan
 }
 
 collect_plans() { # copy each finished plan under blind labels; prints the labels that have one
-  local l env_dir got=""; mkdir -p "$ARENA_DIR/plans"
+  local l env_dir got="" n; mkdir -p "$ARENA_DIR/plans"
   for l in $(labels); do
     env_dir="$(cand_get "$l" '.env_dir')"
     if [ -s "$env_dir/arena-plan.md" ]; then cp "$env_dir/arena-plan.md" "$ARENA_DIR/plans/$l.md"; got+="$l "
     else warn "candidate $l wrote no plan"; fi
     [ -z "$(changed_files "$env_dir/$REPO_REL")" ] || warn "candidate $l changed files while planning; review its tree before it implements"
+    # A planner must not write to its database either: what it leaves there breaks the config gate later.
+    n="$(pending_config "$env_dir" /dev/null)"
+    case "$n" in ""|0|"?") ;; *) warn "candidate $l left $n config change(s) in its database while planning: check 'ddev drush config:status' in $env_dir and revert them before it implements" ;; esac
   done
   printf '%s' "$got"
 }

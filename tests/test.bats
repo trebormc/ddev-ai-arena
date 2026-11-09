@@ -547,6 +547,37 @@ arena_fixture() { # harness
   assert [ -f "$ARENA_DIR/rounds/a-2.json" ]
 }
 
+@test "cli: auto_continue relaunches a clean exit without a report once per phase" {
+  set -eu -o pipefail
+  arena_fixture opencode
+  eval "$(cli_functions auto_continue)"
+  mf_update '.status = "running" | .candidates[0].env_name = "e"'
+  : > "$ENV_DIR/arena-run.json"; echo 0 > "$ENV_DIR/arena-run.exit"
+  container_for() { echo "ddev-$2-opencode"; }
+  container_running() { return 0; }
+  launch_candidate() { echo "launched $1 resume=$3" >> "$TESTDIR/launches"; }
+  warn() { :; }
+  AI_ARENA_AUTO_CONTINUE=1 CONTAINER_ROOT=/var/www/html
+
+  # A failed exit, or no session, is not continued.
+  run auto_continue a 1 ses_1
+  assert_failure
+  run auto_continue a 0 ""
+  assert_failure
+  # A clean exit with a session is continued once, and the stopped round is recorded.
+  auto_continue a 0 ses_1
+  run cat "$TESTDIR/launches"
+  assert_output "launched a resume=1"
+  run jq -c '.candidates[0] | {n:.auto_continues.running, st:.rounds[0].status}' "$MANIFEST"
+  assert_output '{"n":1,"st":"STOPPED"}'
+  run auto_continue a 0 ses_1
+  assert_failure
+  # A candidate cut at the deadline is never continued.
+  mf_update '.status = "drafting" | .candidates[0].cut = true'
+  run auto_continue a 0 ses_1
+  assert_failure
+}
+
 @test "cli: cost_usd stays null when no round reports a cost" {
   set -eu -o pipefail
   arena_fixture claude
@@ -782,6 +813,13 @@ EOF
   run "$SCRIPTS/ai-arena" --project "$COORD_DIR" merge x
   assert_success
   assert_output --partial "changed files while planning"
+  refute_output --partial "config change(s)"
+
+  # A planner that wrote config into its database is reported too.
+  printf '#!/usr/bin/env bash\ncase "$*" in *config:status*) echo %s ;; esac\nexit 0\n' "'[{\"name\":\"field.storage.node.field_scratch\"}]'" > "$TESTDIR/bin/ddev"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" merge x
+  assert_success
+  assert_output --partial "candidate a left 1 config change(s) in its database while planning"
 }
 
 @test "graft needs a promoted environment, skips an empty list, and gates the final environment" {

@@ -73,7 +73,8 @@ until nothing is left to act on. Arenas made with
    informed. A failed spawn for one label is not fatal: report it, continue.
 4. **Plan.** `ai-arena draft <slug>`, then the wait loop (step 7) until no planner is
    `running`. Each candidate investigates its own copy and writes a plan; it changes
-   nothing. A `BLOCKED` planner has no PM behind it yet: put its question to the user and
+   nothing. `merge` warns when a planner changed files or left config in its database
+   (`drush config:status`): clean that environment before `run`, or its config gate fails. A `BLOCKED` planner has no PM behind it yet: put its question to the user and
    `resume` it.
 5. **Merge.** `ai-arena merge <slug>`, in the background (it can take 20 minutes). The PM
    picks one plan blind, improves it with the others and writes `arena/<slug>/brief.md`.
@@ -104,6 +105,9 @@ until nothing is left to act on. Arenas made with
      `REDISPATCH`, `ai-arena resume <slug> <label> "<MESSAGE>"` (for `TO: all`, resume
      every non-finished candidate). On `ASK_USER`, ask the user, send the answer to
      the PM, resume with what it says.
+   - A candidate whose harness exits cleanly without a report (OpenCode can take an automatic
+     compaction for an order to stop) is continued in its session once per phase
+     (`AI_ARENA_AUTO_CONTINUE`); `wait` warns when it does. Only after that is it `FAILED`.
    - `FAILED` → read `worktree-tmp/<env_name>/arena-run.log` and the report; if the
      cause is environmental (container, DB), fix through `spawn`/`resume`; if the
      candidate gave up, leave it and continue.

@@ -309,7 +309,9 @@ forever, the default), database mode, base ref, extra local files, `AI_ARENA_MAI
 who plans (`AI_ARENA_PLAN_BY`, `candidates` by default), the phase deadline
 (`AI_ARENA_DEADLINE_FACTOR`, `2`; `0` disables it), the candidate reviews (`AI_ARENA_CANDIDATE_REVIEWS`,
 `1`), the harnesses that implement in a fresh session reading their own plan instead of
-resuming the planning one (`AI_ARENA_RUN_FRESH`, `opencode`) and the review panel
+resuming the planning one (`AI_ARENA_RUN_FRESH`, `opencode`), how many times per phase a
+candidate that exits cleanly without a report is continued in its session
+(`AI_ARENA_AUTO_CONTINUE`, `1`; `0` fails it at once) and the review panel
 (`AI_ARENA_REVIEWERS`). Candidate
 models are applied through each environment's `.ddev/.env.agents` (the cascade
 `ddev-agents-sync` already honours) plus the harness's `--model` flag.
