@@ -64,8 +64,11 @@ if [ ! -f "$HOME/.ddev/ai-arena/config.env" ]; then
 # Hard cap on candidates per arena; each one is a full copy of the main environment.
 #AI_ARENA_MAX_CANDIDATES=3
 
-# Seconds `ai-arena wait` blocks before giving up (0 = forever).
+# Seconds `ai-arena review` and the candidate reviews before `judge` may take (0 = no limit).
 #AI_ARENA_TIMEOUT=7200
+
+# Seconds `ai-arena wait` blocks before giving up (0 = forever).
+#AI_ARENA_WAIT_TIMEOUT=0
 
 # Database for new environments: auto (snapshot, then newest backups/ dump, then an
 # export of main), snapshot, latest, file:<path>, export, none.

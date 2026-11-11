@@ -212,7 +212,9 @@ slugify() {
 # ---------------------------------------------------------------------------
 harness_user() { case "$1" in claude) echo claude ;; opencode) echo opencode ;; *) die "unknown harness '$1' (use claude or opencode)" ;; esac; }
 container_for() { case "$1" in claude) echo "ddev-$2-claude-code" ;; opencode) echo "ddev-$2-opencode" ;; *) die "unknown harness '$1'" ;; esac; }
-container_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; }
+# The whole list is read before matching: `grep -q` leaving early would SIGPIPE docker and,
+# under pipefail, report a running container as stopped.
+container_running() { local names; names="$(docker ps --format '{{.Names}}' 2>/dev/null)" || return 1; grep -qxF -- "$1" <<< "$names"; }
 
 harness_cmd() { # harness model session prompt_file_in_container
   local harness="$1" model="$2" session="$3" pfile="$4" cmd
@@ -284,7 +286,8 @@ parse_verdict() { # text_file -> json
   verdict="$(grep -E '^VERDICT:' "$f" | tail -n1 | sed -E 's/^VERDICT:[[:space:]]*//' || true)"
   to="$(grep -E '^TO:' "$f" | tail -n1 | sed -E 's/^TO:[[:space:]]*//' || true)"
   winner="$(grep -E '^WINNER:' "$f" | tail -n1 | sed -E 's/^WINNER:[[:space:]]*//' || true)"
-  message="$(awk 'found{print} /^MESSAGE:/{found=1; sub(/^MESSAGE:[[:space:]]*/, ""); print}' "$f" || true)"
+  # Every field comes from its last occurrence: the PM may quote the trailer format earlier.
+  message="$(awk '/^MESSAGE:/{found=1; sub(/^MESSAGE:[[:space:]]*/, ""); buf=$0; next} found{buf=buf "\n" $0} END{if (found) print buf}' "$f" || true)"
   jq -n --arg verdict "$verdict" --arg to "$to" --arg winner "$winner" --arg message "$message" --rawfile raw "$f" \
     '{verdict:$verdict, to:$to, winner:$winner, message:$message, raw:$raw}'
 }
@@ -407,7 +410,18 @@ auto_continue() { # label exit_code session -> 0 if relaunched
   launch_candidate "$label" "Nobody asked you to stop: the run ended without a report, probably after an automatic context compaction. Continue the task from where you were, finish it as your instructions say and write $CONTAINER_ROOT/arena-report.md (STATUS first line)." 1
 }
 
+# `status` and a background `wait` can both find the exit file of the same candidate. One
+# settles it; the other waits for the lock, sees it is no longer running and only reports
+# the state (settling twice would count the round twice and restart its reviews).
 settle_candidate() { # label -> prints new state
+  (
+    flock 8
+    [ "$(cand_get "$1" '.state')" = running ] || { cand_get "$1" '.state'; exit 0; }
+    settle_candidate_locked "$1"
+  ) 8> "$ARENA_DIR/settle.lock"
+}
+
+settle_candidate_locked() { # label -> prints new state
   local label="$1" env_dir harness exit_code report status="" session
   env_dir="$(cand_get "$label" '.env_dir')"; harness="$(cand_get "$label" '.harness')"
   [ -f "$env_dir/arena-run.exit" ] || { echo running; return 0; }
@@ -551,7 +565,13 @@ changed_files() { # wt_repo
 }
 
 report_files() { # report -> the FILES section, one path per line, relative to the repository
-  sed -n '/^FILES:/,/^[A-Z][A-Z ]*:/p' "$1" | sed '1d;$d' | sed -E 's/^[-* ]+//; s/[[:space:]]+$//' | { grep -vE '^$|^<|^\(' || true; } | sed -E "s#^$REPO_REL/##"
+  # Tolerant on purpose: a path on the FILES: line itself, backticks, a trailing "(new)" note
+  # and FILES as the last section are all shapes candidates write; none may fail the gate.
+  awk '/^FILES:/ { f = 1; sub(/^FILES:[[:space:]]*/, ""); if ($0 != "") print; next }
+       f && /^[A-Z][A-Z -]*:/ { exit }
+       f' "$1" \
+    | sed -E 's/^[-* ]+//; s/`//g; s/[[:space:]]+\([^()]*\)[[:space:]]*$//; s/[[:space:]]+$//' \
+    | { grep -vE '^$|^<|^\(' || true; } | sed -E "s#^$REPO_REL/##"
 }
 
 undeclared_files() { # changed_list report_list -> changed paths the report does not list
@@ -794,7 +814,12 @@ cmd_plan() {
     fi
   fi
   msg="${msg//\{\{APPROACHES\}\}/$block}"
-  pm_call "$msg"
+  local out; out="$(pm_call "$msg")"; printf '%s\n' "$out"
+  if [ ! -s "$ARENA_DIR/brief.md" ] && [ "$(jq -r '.verdict' <<< "$out" | tr -d '[:space:]')" = ASK_USER ]; then
+    # The plan prompt tells the PM not to write the brief when only the user can decide.
+    warn "the PM needs the user before it can write the brief: answer it with 'ai-arena pm $SLUG \"<answer>\"', then run 'ai-arena plan $SLUG' again"
+    return 0
+  fi
   if [ ! -s "$ARENA_DIR/brief.md" ]; then
     # The usual cause: the PM delegated the plan to a background subagent that the harness
     # killed. One retry, explicitly in the foreground, before giving up.
@@ -1048,7 +1073,14 @@ cmd_judge() {
     block+="${block:+ }GRAFTS: besides the winner, write $CONTAINER_ARENA/grafts.md, the list a fresh agent will port into the winner: one item per concrete improvement, naming the source label, its file, what to port and why it beats the winner's version, plus one item per confirmed review finding on the winner, as a fix. Only what is clearly better or confirmed; write the single word none if nothing is."
   fi
   msg="${msg//\{\{APPROACHES\}\}/$block}"
-  out="$(pm_call "$msg")"; mf_update --argjson j "$out" '.judge = $j | .status = "judged"'; printf '%s\n' "$out"
+  out="$(pm_call "$msg")"; printf '%s\n' "$out"
+  # A judgment names a real label, or says BLOCKED (no acceptable candidate). Anything else is
+  # a failed PM call or a garbled trailer: leave the arena as it was so judge can run again.
+  local verdict winner; verdict="$(jq -r '.verdict' <<< "$out" | tr -d '[:space:]')"; winner="$(jq -r '.winner' <<< "$out" | tr -d '[:space:]')"
+  if [ "$verdict" != BLOCKED ] && ! jq -e --arg l "$winner" '.candidates[] | select(.label==$l)' "$MANIFEST" >/dev/null; then
+    die "the PM reply is not a judgment (VERDICT '${verdict:-none}', WINNER '${winner:-none}' is not a label); see arena/$SLUG/pm/ and run judge again"
+  fi
+  mf_update --argjson j "$out" '.judge = $j | .status = "judged"'
 }
 
 grafts_empty() { # grafts.md -> success when it lists nothing to port
@@ -1132,7 +1164,9 @@ cmd_reveal() {
   jq -r '.candidates[] | [.label, .harness, (.model // "(default)"), (.agents // "-"), (.cost_usd // "-" | tostring), (.duration_s // "-" | tostring), (.approach // "-")] | @tsv' "$MANIFEST" | while IFS=$'\t' read -r l h m a c t ap; do printf '%-6s %-9s %-24s %-24s %-8s %-7s %s\n' "$l" "$h" "$m" "$a" "$c" "$t" "$ap"; done
   if [ -n "$winner" ]; then
     mkdir -p "$(dirname "$WINS_LOG")"; [ -f "$WINS_LOG" ] || printf 'ts\tproject\tslug\twinner\tharness\tmodel\tagents\tcost_usd\tduration_s\tcandidates\n' > "$WINS_LOG"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$COORD" "$SLUG" "$winner" "$(cand_get "$winner" '.harness')" "$(cand_get "$winner" '.model // "(default)"')" \
+    # One row per arena: reveal can be run again without logging the win twice.
+    if awk -F'\t' -v p="$COORD" -v s="$SLUG" '$2 == p && $3 == s { found = 1 } END { exit !found }' "$WINS_LOG"; then log "already logged in $WINS_LOG"; return 0; fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now)" "$COORD" "$SLUG" "$winner""$(cand_get "$winner" '.harness')" "$(cand_get "$winner" '.model // "(default)"')" \
       "$(cand_get "$winner" '.agents // "-"')" "$(cand_get "$winner" '.cost_usd // "-"')" "$(cand_get "$winner" '.duration_s // "-"')" \
       "$(jq -r '[.candidates[] | .harness + ":" + (.model // "default") + (if .agents then "@" + .agents else "" end) + (if .approach then "#" + .approach else "" end) + "=" + (.cost_usd // "-" | tostring) + "$/" + (.duration_s // "-" | tostring) + "s"] | join(",")' "$MANIFEST")" >> "$WINS_LOG"
     log "logged to $WINS_LOG"

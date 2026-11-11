@@ -463,6 +463,19 @@ EOF
   assert_success
   run bash -c "$(declare -f cli_env); cli_env; $(cli_functions parse_verdict); parse_verdict '$TESTDIR/verdict.md' | jq -r '[.verdict, .to, .winner, (.message | gsub(\"\\n\"; \" \"))] | join(\"|\")'"
   assert_output "question|alpha||Which cache tags should be invalidated?"
+
+  # A PM that quotes the trailer format first: every field comes from its last occurrence.
+  cat > "$TESTDIR/verdict.md" <<'EOF'
+The trailer is:
+VERDICT: <JUDGED|BLOCKED>
+MESSAGE: <text>
+VERDICT: JUDGED
+TO: none
+WINNER: b
+MESSAGE: b wins on the rubric.
+EOF
+  run bash -c "$(declare -f cli_env); cli_env; $(cli_functions parse_verdict); parse_verdict '$TESTDIR/verdict.md' | jq -r '[.verdict, .winner, .message] | join(\"|\")'"
+  assert_output "JUDGED|b|b wins on the rubric."
 }
 
 @test "cli: slugify produces short DDEV-safe slugs" {
@@ -641,6 +654,21 @@ EOF
   : > "$TESTDIR/none.txt"
   run undeclared_files "$TESTDIR/declared.txt" "$TESTDIR/declared.txt"
   assert_output ""
+}
+
+@test "cli: report_files accepts the shapes candidates write" {
+  set -eu -o pipefail
+  cli_env
+  eval "$(cli_functions report_files)"
+  REPO_REL=app
+  # A path on the FILES: line, backticks, a trailing note, a hyphenated next header.
+  printf 'STATUS: DONE\nFILES: web/a.php\n- `web/b.php`\n* app/web/c.php (new)\nSELF-REVIEW: no findings\nweb/not-a-file.php\n' > "$TESTDIR/report.md"
+  run report_files "$TESTDIR/report.md"
+  assert_output "$(printf 'web/a.php\nweb/b.php\nweb/c.php')"
+  # FILES as the last section keeps its last path; the template placeholder is not a path.
+  printf 'STATUS: DONE\nFILES: <one path per line>\nweb/a.php\nweb/b.php\n' > "$TESTDIR/report.md"
+  run report_files "$TESTDIR/report.md"
+  assert_output "$(printf 'web/a.php\nweb/b.php')"
 }
 
 patch_for() { # file body
@@ -897,6 +925,40 @@ EOF
   run jq -r '.deadline.phase' "$m"; assert_output "running"
   AI_ARENA_DEADLINE_FACTOR=1.5; deadline_note b DONE 2>/dev/null
   run jq -c '[.deadline.phase, .deadline.limit_s]' "$m"; assert_output '["drafting",1350]'
+}
+
+@test "plan stops at ASK_USER without a brief and judge refuses a reply that names no label" {
+  set -eu -o pipefail
+  git_arena
+  phased_docker
+  local m="$COORD_DIR/arena/x/manifest.json"
+  # The PM answers without writing the brief.
+  sed -i 's|echo contract > "$STUB_BRIEF"|:|; s|VERDICT: DONE|VERDICT: ASK_USER|; s|WINNER: a|WINNER: none|' "$TESTDIR/bin/docker"
+  jq '.plan_by = "pm" | .status = "created"' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+  : > "$STUB_LOG"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" plan x
+  assert_success
+  assert_output --partial "the PM needs the user"
+  refute_output --partial "asking it once more"
+  run grep -c . "$STUB_LOG"
+  assert_output "1"
+  run jq -r '.status' "$m"
+  assert_output "created"
+
+  # Same reply to judge: no label, not BLOCKED, so the arena is not marked judged.
+  printf 'STATUS: DONE\n' > "$COORD_DIR/arena/x/candidates/a/report.md"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" judge x
+  assert_failure
+  assert_output --partial "is not a judgment"
+  run jq -r '.status' "$m"
+  assert_output "created"
+
+  # BLOCKED is a judgment without a winner.
+  sed -i 's|VERDICT: ASK_USER|VERDICT: BLOCKED|' "$TESTDIR/bin/docker"
+  run "$SCRIPTS/ai-arena" --project "$COORD_DIR" judge x
+  assert_success
+  run jq -r '.status + ":" + .judge.verdict' "$m"
+  assert_output "judged:BLOCKED"
 }
 
 @test "wait stops a candidate past the deadline, marks it cut and the judge is told" {
